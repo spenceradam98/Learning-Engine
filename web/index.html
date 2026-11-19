@@ -1,0 +1,619 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Learning Engine</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --card: #ffffff; --text: #1c2330; --muted: #637083; --line: #dde2ea;
+    --accent: #2563eb; --accent-text: #ffffff; --good: #15803d; --good-bg: #e7f6ec;
+    --bad: #b91c1c; --bad-bg: #fdecec; --warn: #a16207; --warn-bg: #fdf6e3; --chip: #eef2f8;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #12151b; --card: #1b2029; --text: #e6e9ef; --muted: #98a2b3; --line: #2c3340;
+      --accent: #5b8def; --accent-text: #0b0e13; --good: #4ade80; --good-bg: #16301f;
+      --bad: #f87171; --bad-bg: #3a1a1a; --warn: #facc15; --warn-bg: #352d12; --chip: #252c38;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 16px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+  header { display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+           padding: 12px 20px; background: var(--card); border-bottom: 1px solid var(--line); }
+  header h1 { font-size: 18px; margin: 0; }
+  nav { display: flex; gap: 4px; flex-wrap: wrap; }
+  nav button { background: none; border: 0; color: var(--muted); padding: 8px 12px; border-radius: 8px;
+               font: inherit; cursor: pointer; }
+  nav button.active { background: var(--chip); color: var(--text); font-weight: 600; }
+  #ai { margin-left: auto; font-size: 13px; color: var(--muted); }
+  main { max-width: 860px; margin: 0 auto; padding: 20px 16px 60px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 20px; margin-bottom: 16px; }
+  h2 { font-size: 20px; margin: 0 0 12px; }
+  h3 { font-size: 16px; margin: 16px 0 8px; }
+  label { display: block; font-size: 14px; color: var(--muted); margin: 10px 0 4px; }
+  input, select, textarea { width: 100%; padding: 9px 10px; border: 1px solid var(--line); border-radius: 8px;
+                            background: var(--bg); color: var(--text); font: inherit; }
+  textarea { min-height: 140px; resize: vertical; }
+  .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: flex-end; }
+  .row > * { flex: 1 1 160px; }
+  button.btn { background: var(--accent); color: var(--accent-text); border: 0; border-radius: 8px;
+               padding: 9px 16px; font: inherit; font-weight: 600; cursor: pointer; }
+  button.btn.secondary { background: var(--chip); color: var(--text); }
+  button.btn:disabled { opacity: .5; cursor: default; }
+  .btns { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
+  .muted { color: var(--muted); font-size: 14px; }
+  .choice { display: block; width: 100%; text-align: left; margin: 8px 0; padding: 12px 14px;
+            border: 1px solid var(--line); border-radius: 10px; background: var(--bg); color: var(--text);
+            font: inherit; cursor: pointer; }
+  .choice:hover:not(:disabled) { border-color: var(--accent); }
+  .choice.right { border-color: var(--good); background: var(--good-bg); }
+  .choice.wrong { border-color: var(--bad); background: var(--bad-bg); }
+  .choice b { display: inline-block; width: 24px; }
+  .pill { display: inline-block; padding: 2px 10px; border-radius: 999px; background: var(--chip); font-size: 13px; }
+  .note { padding: 10px 14px; border-radius: 10px; margin: 12px 0; }
+  .note.good { background: var(--good-bg); color: var(--good); }
+  .note.bad { background: var(--bad-bg); color: var(--bad); }
+  .note.warn { background: var(--warn-bg); color: var(--warn); }
+  .out { white-space: normal; }
+  .out p { margin: 8px 0; }
+  .out ul, .out ol { margin: 6px 0; padding-left: 22px; }
+  .thinking::after { content: "Thinking"; animation: dots 1.2s steps(4) infinite; color: var(--muted); }
+  @keyframes dots { 0% { content: "Thinking"; } 25% { content: "Thinking."; } 50% { content: "Thinking.."; } 75% { content: "Thinking..."; } }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--line); }
+  .bar { height: 8px; border-radius: 4px; background: var(--chip); overflow: hidden; min-width: 80px; }
+  .bar span { display: block; height: 100%; }
+  .list-item { display: flex; justify-content: space-between; align-items: center; gap: 12px;
+               padding: 10px 0; border-bottom: 1px solid var(--line); }
+  .list-item:last-child { border-bottom: 0; }
+  .hidden { display: none !important; }
+  progress { width: 100%; height: 10px; }
+  .chat .me { background: var(--chip); padding: 8px 12px; border-radius: 10px; margin: 10px 0; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Learning Engine</h1>
+  <nav id="nav">
+    <button data-tab="quiz" class="active">Quiz me</button>
+    <button data-tab="generate">Generate</button>
+    <button data-tab="review">Weak spots</button>
+    <button data-tab="assign">Assignments</button>
+    <button data-tab="settings">AI settings</button>
+  </nav>
+  <span id="ai"></span>
+</header>
+<main>
+  <!-- QUIZ -->
+  <section id="tab-quiz">
+    <div class="card" id="quiz-setup">
+      <h2>Quiz me</h2>
+      <p class="muted">3 right in a row moves you up a level. 2 wrong in a row moves you down and re-explains the idea.</p>
+      <div class="row">
+        <div><label>Topic</label><select id="quiz-topic"></select></div>
+        <div style="flex:0 1 120px"><label>Questions</label><input id="quiz-n" type="number" min="1" max="50" value="10"></div>
+      </div>
+      <div class="btns"><button class="btn" id="quiz-start">Start quiz</button></div>
+      <div id="quiz-setup-msg"></div>
+    </div>
+    <div class="card hidden" id="quiz-box">
+      <div class="row" style="align-items:center">
+        <div id="quiz-title" style="font-weight:600"></div>
+        <div style="flex:0 0 auto"><span class="pill" id="quiz-meta"></span></div>
+      </div>
+      <div id="quiz-body"></div>
+      <div class="btns"><button class="btn secondary" id="quiz-stop">Stop quiz</button></div>
+    </div>
+  </section>
+
+  <!-- GENERATE -->
+  <section id="tab-generate" class="hidden">
+    <div class="card">
+      <h2>Generate new questions</h2>
+      <p class="muted">New questions are made one at a time. With the local model each one can take about a minute.</p>
+      <div class="row">
+        <div><label>Topic</label><select id="gen-topic"></select></div>
+        <div style="flex:0 1 110px"><label>How many</label><input id="gen-n" type="number" min="1" max="20" value="10"></div>
+        <div style="flex:0 1 170px"><label>Level</label>
+          <select id="gen-level"><option value="">Around my level</option><option>1</option><option>2</option><option>3</option><option>4</option><option>5</option></select></div>
+      </div>
+      <div class="btns"><button class="btn" id="gen-go">Generate</button></div>
+      <div id="gen-status" class="hidden"><p id="gen-msg" class="muted"></p><progress id="gen-bar" value="0" max="10"></progress></div>
+      <div id="gen-result"></div>
+    </div>
+    <div class="card"><h2>Question bank</h2><div id="topics-table"></div></div>
+  </section>
+
+  <!-- REVIEW -->
+  <section id="tab-review" class="hidden"><div id="review-body"></div></section>
+
+  <!-- ASSIGNMENTS -->
+  <section id="tab-assign" class="hidden">
+    <div id="assign-list-view">
+      <div class="card">
+        <div class="row" style="align-items:center"><h2 style="margin:0">Your assignments</h2>
+          <div style="flex:0 0 auto"><button class="btn" id="assign-new">Add assignment</button></div></div>
+        <div id="assign-list" style="margin-top:8px"></div>
+      </div>
+      <div class="card hidden" id="assign-form">
+        <h2>Add an assignment</h2>
+        <div class="row">
+          <div><label>Title</label><input id="af-title" placeholder="e.g. Live sound report: festival stage"></div>
+          <div><label>Course / module (optional)</label><input id="af-course"></div>
+          <div style="flex:0 1 160px"><label>Due (optional)</label><input id="af-due" placeholder="e.g. 12 Dec"></div>
+        </div>
+        <label>Assignment brief (paste the whole task)</label><textarea id="af-brief"></textarea>
+        <label>Marking rubric or criteria (optional)</label><textarea id="af-rubric" style="min-height:90px"></textarea>
+        <div class="btns"><button class="btn" id="af-save">Save</button><button class="btn secondary" id="af-cancel">Cancel</button></div>
+        <div id="af-msg"></div>
+      </div>
+    </div>
+    <div id="assign-detail" class="hidden">
+      <div class="card">
+        <div class="btns" style="margin-top:0"><button class="btn secondary" id="ad-back">← All assignments</button></div>
+        <h2 id="ad-title" style="margin-top:12px"></h2>
+        <p class="muted" id="ad-meta"></p>
+        <nav id="ad-nav" style="margin:8px 0 0">
+          <button data-sub="learn" class="active">Learn</button>
+          <button data-sub="write">Writing coach</button>
+          <button data-sub="aquiz">Quiz</button>
+          <button data-sub="brief">Brief</button>
+        </nav>
+      </div>
+      <div class="card" id="ad-learn">
+        <h3 style="margin-top:0">Key concepts for this assignment</h3>
+        <div id="ad-concepts"></div>
+        <div id="ad-lesson" class="hidden">
+          <div id="ad-lesson-out" class="out chat"></div>
+          <div class="row"><div><input id="ad-follow" placeholder="Ask a follow-up question..."></div>
+            <div style="flex:0 0 auto"><button class="btn" id="ad-follow-go">Ask</button></div></div>
+        </div>
+      </div>
+      <div class="card hidden" id="ad-write">
+        <p class="note warn">Coaching only: this helps you plan, get unstuck and improve your own writing. It won't write the assignment for you.</p>
+        <div class="btns"><button class="btn" id="aw-plan">Plan it: structure and guiding questions</button></div>
+        <h3>I'm stuck</h3>
+        <div class="row"><div><input id="aw-stuck" placeholder="Which part, and what have you tried?"></div>
+          <div style="flex:0 0 auto"><button class="btn secondary" id="aw-hint">Get hints</button></div></div>
+        <h3>Feedback on my draft</h3>
+        <textarea id="aw-draft" placeholder="Paste your draft or one section of it"></textarea>
+        <div class="btns"><button class="btn secondary" id="aw-feedback">Get feedback</button></div>
+        <div id="aw-out" class="out" style="margin-top:16px"></div>
+        <h3>Saved</h3><div id="aw-saved" class="muted"></div>
+      </div>
+      <div class="card hidden" id="ad-aquiz">
+        <p>Quiz yourself on the concepts this assignment needs. It uses the same adaptive levels.</p>
+        <div class="btns"><button class="btn" id="aq-go">Start assignment quiz</button>
+          <button class="btn secondary" id="aq-gen">Make 5 questions first</button></div>
+        <div id="aq-msg"></div>
+      </div>
+      <div class="card hidden" id="ad-brief"><div id="ad-brief-text" class="out"></div>
+        <div class="btns"><button class="btn secondary" id="ad-delete">Delete this assignment</button></div></div>
+    </div>
+  </section>
+
+  <!-- SETTINGS -->
+  <section id="tab-settings" class="hidden">
+    <div class="card">
+      <h2>AI settings</h2>
+      <p class="muted">Use the local model on your Mac, or a free online API. Online is much faster, but your questions and pasted assignment text are sent to that service.</p>
+      <label>Provider</label><select id="set-provider"></select>
+      <p id="set-keylink" class="muted"></p>
+      <div id="set-url-wrap"><label>API address</label><input id="set-url"></div>
+      <div id="set-model-wrap"><label>Model name</label><input id="set-model"></div>
+      <div id="set-key-wrap"><label>API key</label><input id="set-key" type="password" autocomplete="off"></div>
+      <div class="btns"><button class="btn" id="set-save">Save</button><button class="btn secondary" id="set-check">Test connection</button></div>
+      <div id="set-msg"></div>
+    </div>
+  </section>
+</main>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const LETTERS = "ABCD";
+let STATUS = null, TOPICS = [], QUIZ = null, ASSIGN = null, LESSON = null;
+
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
+}
+// Tiny, safe Markdown: headings, bold, italics, code, bullet and numbered lists.
+function md(text) {
+  const lines = esc(text).split("\n");
+  let html = "", list = null;
+  const inline = (s) => s.replace(/\*\*(.+?)\*\*/g, "<b>$1</b>").replace(/`([^`]+)`/g, "<code>$1</code>")
+                        .replace(/(^|\W)\*(?!\s)(.+?)\*(?=\W|$)/g, "$1<i>$2</i>");
+  const close = () => { if (list) { html += "</" + list + ">"; list = null; } };
+  for (const raw of lines) {
+    const line = raw.trimEnd();
+    let m;
+    if ((m = line.match(/^\s*#{1,6}\s+(.*)/))) { close(); html += "<h3>" + inline(m[1]) + "</h3>"; }
+    else if ((m = line.match(/^\s*[-*•]\s+(.*)/))) { if (list !== "ul") { close(); html += "<ul>"; list = "ul"; } html += "<li>" + inline(m[1]) + "</li>"; }
+    else if ((m = line.match(/^\s*\d+[.)]\s+(.*)/))) { if (list !== "ol") { close(); html += "<ol>"; list = "ol"; } html += "<li>" + inline(m[1]) + "</li>"; }
+    else if (!line.trim()) { close(); }
+    else { close(); html += "<p>" + inline(line) + "</p>"; }
+  }
+  close();
+  return html;
+}
+function note(el, kind, text) { el.innerHTML = '<div class="note ' + kind + '">' + esc(text) + "</div>"; }
+
+async function api(path, body, method) {
+  const opts = {method: method || (body ? "POST" : "GET"), headers: {}};
+  if (body) { opts.headers["Content-Type"] = "application/json"; opts.body = JSON.stringify(body); }
+  const r = await fetch(path, opts);
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || ("HTTP " + r.status));
+  return data;
+}
+// Streams model text into `el` as it's written. Returns the full text.
+async function streamTo(path, body, el, append) {
+  const box = document.createElement("div");
+  box.className = "thinking";
+  if (!append) el.innerHTML = "";
+  el.appendChild(box);
+  try {
+    const r = await fetch(path, {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body || {})});
+    if (!r.ok) { const d = await r.json().catch(() => ({})); throw new Error(d.error || ("HTTP " + r.status)); }
+    const reader = r.body.getReader(), dec = new TextDecoder();
+    let text = "";
+    for (;;) {
+      const {done, value} = await reader.read();
+      if (done) break;
+      text += dec.decode(value, {stream: true});
+      box.className = "out";
+      box.innerHTML = md(text);
+    }
+    box.className = "out";
+    box.innerHTML = md(text);
+    return text;
+  } catch (e) {
+    box.className = "";
+    note(box, "bad", e.message);
+    return null;
+  }
+}
+function busy(btn, on) { if (btn) btn.disabled = on; }
+
+// ---------- tabs ----------
+function showTab(name) {
+  document.querySelectorAll("#nav button").forEach((b) => b.classList.toggle("active", b.dataset.tab === name));
+  document.querySelectorAll("main > section").forEach((s) => s.classList.toggle("hidden", s.id !== "tab-" + name));
+  if (name === "review") loadReview();
+  if (name === "generate") loadTopics();
+  if (name === "assign") loadAssignments();
+  if (name === "settings") fillSettings();
+}
+$("nav").addEventListener("click", (e) => { if (e.target.dataset.tab) showTab(e.target.dataset.tab); });
+
+// ---------- status & topics ----------
+async function loadStatus() {
+  STATUS = await api("/api/status");
+  $("ai").textContent = "AI: " + STATUS.label + (STATUS.provider === "local" ? "" : " · " + STATUS.model);
+}
+async function loadTopics() {
+  const d = await api("/api/topics");
+  TOPICS = d.topics;
+  for (const sel of [$("quiz-topic"), $("gen-topic")]) {
+    const keep = sel.value;
+    sel.innerHTML = TOPICS.map((t) => '<option value="' + esc(t.key) + '">' + esc(t.kind === "assignment" ? "Assignment: " + t.name : t.name) + "</option>").join("");
+    if (keep && TOPICS.some((t) => t.key === keep)) sel.value = keep;
+  }
+  $("topics-table").innerHTML = "<table><tr><th>Topic</th><th>Questions</th><th>Level</th><th>Answered</th><th>Accuracy</th></tr>" +
+    TOPICS.map((t) => "<tr><td>" + esc(t.name) + "</td><td>" + t.questions + "</td><td>" + t.difficulty + "/5</td><td>" +
+      t.answered + "</td><td>" + (t.answered ? Math.round(t.accuracy * 100) + "%" : "-") + "</td></tr>").join("") + "</table>";
+}
+
+// ---------- quiz ----------
+async function startQuiz(topic) {
+  const msg = $("quiz-setup-msg");
+  msg.innerHTML = '<p class="thinking"></p>';
+  busy($("quiz-start"), true);
+  try {
+    const d = await api("/api/quiz/start", {topic: topic || $("quiz-topic").value, n: +$("quiz-n").value || 10});
+    QUIZ = {session: d.session, name: d.name};
+    msg.innerHTML = d.bank ? "" : '<div class="note warn">No saved questions yet, so they\'ll be made as you go. Each can take a minute on the local model.</div>';
+    $("quiz-title").textContent = d.name;
+    $("quiz-box").classList.remove("hidden");
+    $("quiz-setup").classList.add("hidden");
+    nextQuestion();
+  } catch (e) { note(msg, "bad", e.message); }
+  busy($("quiz-start"), false);
+}
+async function nextQuestion() {
+  const body = $("quiz-body");
+  body.innerHTML = '<p class="thinking"></p>';
+  try {
+    const d = await api("/api/quiz/next", {session: QUIZ.session});
+    if (d.finished) return showSummary(d.summary);
+    QUIZ.q = d.question; QUIZ.chosen = null;
+    $("quiz-meta").textContent = "Question " + d.number + "/" + d.length + " · level " + d.difficulty + "/5";
+    body.innerHTML = '<p class="muted">' + esc(d.question.subtopic || "") + '</p><h3>' + esc(d.question.question) + "</h3>" +
+      d.question.choices.map((c, i) => '<button class="choice" data-i="' + i + '"><b>' + LETTERS[i] + "</b>" + esc(c) + "</button>").join("") +
+      '<div id="conf" class="hidden"><label>How sure were you?</label><div class="btns">' +
+      '<button class="btn secondary" data-c="1">Guessing</button><button class="btn secondary" data-c="2">Fairly sure</button>' +
+      '<button class="btn secondary" data-c="3">Certain</button></div></div><div id="quiz-result"></div>';
+  } catch (e) { note(body, "bad", e.message); }
+}
+$("quiz-body").addEventListener("click", async (e) => {
+  const choice = e.target.closest(".choice"), conf = e.target.closest("[data-c]");
+  if (choice && QUIZ.chosen === null) {
+    QUIZ.chosen = +choice.dataset.i;
+    document.querySelectorAll(".choice").forEach((b) => { b.disabled = true; b.style.opacity = b === choice ? 1 : .6; });
+    $("conf").classList.remove("hidden");
+  } else if (conf && !conf.disabled) {
+    document.querySelectorAll("[data-c]").forEach((b) => (b.disabled = true));
+    try {
+      const r = await api("/api/quiz/answer", {session: QUIZ.session, chosen: QUIZ.chosen, confidence: +conf.dataset.c});
+      showAnswer(r);
+    } catch (err) { note($("quiz-result"), "bad", err.message); }
+  } else if (e.target.id === "quiz-next") {
+    if (QUIZ.finished) showSummary(QUIZ.finished); else nextQuestion();
+  }
+});
+async function showAnswer(r) {
+  document.querySelectorAll(".choice").forEach((b, i) => {
+    b.style.opacity = 1;
+    if (i === r.answer_index) b.classList.add("right");
+    else if (i === r.chosen) b.classList.add("wrong");
+  });
+  $("conf").classList.add("hidden");
+  const out = $("quiz-result");
+  let html = '<div class="note ' + (r.correct ? "good" : "bad") + '">' + (r.correct ? "Correct! " : "Not quite. ") + esc(r.explanation) + "</div>";
+  if (r.change === "up") html += '<div class="note good">Three in a row. Moving up to level ' + r.difficulty + ".</div>";
+  if (r.change === "down") html += '<div class="note warn">Dropping to level ' + r.difficulty + " so we can rebuild the basics.</div>";
+  html += '<div id="reexplain"></div>';
+  out.innerHTML = html;
+  QUIZ.finished = r.finished ? r.summary : null;
+  if (r.reexplain) {
+    const box = $("reexplain");
+    box.innerHTML = "<h3>Let's go over this again</h3>";
+    await streamTo("/api/quiz/reexplain", {session: QUIZ.session}, box, true);
+  }
+  out.insertAdjacentHTML("beforeend", '<div class="btns"><button class="btn" id="quiz-next">' + (r.finished ? "See results" : "Next question") + "</button></div>");
+  $("quiz-next").focus();
+}
+function showSummary(s) {
+  $("quiz-meta").textContent = "Finished";
+  $("quiz-body").innerHTML = "<h3>You got " + s.correct + "/" + s.answered + " right</h3><p>Level " + s.start_difficulty + " → " + s.end_difficulty + "</p>" +
+    (s.weak_spots.length ? "<p>Weakest right now: " + s.weak_spots.map((w) => esc(w.subtopic)).join(", ") + "</p>" : "") +
+    '<div class="btns"><button class="btn" id="quiz-again">New quiz</button></div>';
+  $("quiz-again").onclick = resetQuiz;
+  QUIZ = null;
+}
+function resetQuiz() { $("quiz-box").classList.add("hidden"); $("quiz-setup").classList.remove("hidden"); loadTopics(); }
+$("quiz-start").onclick = () => startQuiz();
+$("quiz-stop").onclick = async () => {
+  if (QUIZ) { try { const d = await api("/api/quiz/stop", {session: QUIZ.session}); if (d.summary.answered) return showSummary(d.summary); } catch (e) {} }
+  QUIZ = null; resetQuiz();
+};
+
+// ---------- generate ----------
+$("gen-go").onclick = async () => {
+  const btn = $("gen-go"), n = +$("gen-n").value || 10;
+  busy(btn, true);
+  $("gen-result").innerHTML = "";
+  $("gen-status").classList.remove("hidden");
+  $("gen-bar").max = n; $("gen-bar").value = 0;
+  $("gen-msg").textContent = "Starting...";
+  try {
+    const r = await fetch("/api/generate", {method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({topic: $("gen-topic").value, n: n, level: $("gen-level").value || null})});
+    if (!r.ok) { const d = await r.json().catch(() => ({})); throw new Error(d.error || ("HTTP " + r.status)); }
+    const reader = r.body.getReader(), dec = new TextDecoder();
+    let buf = "";
+    for (;;) {
+      const {done, value} = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, {stream: true});
+      let nl;
+      while ((nl = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, nl); buf = buf.slice(nl + 1);
+        if (!line.trim()) continue;
+        const m = JSON.parse(line);
+        if (m.error) throw new Error(m.error);
+        if (m.result) {
+          const x = m.result;
+          note($("gen-result"), "good", "Added " + x.added + " new questions (" + x.total + " in the bank)." +
+            (x.duplicates ? " " + x.duplicates + " repeats skipped." : "") + (x.failed ? " " + x.failed + " couldn't be made." : ""));
+        } else {
+          $("gen-bar").value = m.done;
+          $("gen-msg").textContent = m.done < m.total ? "Question " + (m.done + 1) + "/" + m.total + ": " + m.msg : "Done";
+        }
+      }
+    }
+  } catch (e) { note($("gen-result"), "bad", e.message); }
+  $("gen-status").classList.add("hidden");
+  busy(btn, false);
+  loadTopics();
+};
+
+// ---------- review ----------
+async function loadReview() {
+  const el = $("review-body");
+  el.innerHTML = '<div class="card"><p class="thinking"></p></div>';
+  try {
+    const d = await api("/api/review");
+    if (!d.reports.length) { el.innerHTML = '<div class="card"><h2>Weak spots</h2><p>No quiz history yet. Take a quiz first.</p></div>'; return; }
+    el.innerHTML = d.reports.map((r, i) => {
+      const rows = r.subtopics.map((s) => {
+        const pct = Math.round(s.mastery * 100), col = s.mastery < 0.45 ? "var(--bad)" : s.mastery < 0.6 ? "var(--warn)" : "var(--good)";
+        return "<tr><td>" + esc(s.subtopic) + '</td><td><div class="bar"><span style="width:' + pct + "%;background:" + col + '"></span></div></td><td>' + pct + "%</td><td>" + s.correct + "/" + s.seen + "</td></tr>";
+      }).join("");
+      const misses = r.misses.slice(0, 5).map((m) => "<li>" + esc(m.question) + ' <span class="muted">(answer: ' + esc(m.answer) + ")</span></li>").join("");
+      return '<div class="card"><h2>' + esc(r.name) + '</h2><p class="muted">' + r.totals.answered + " answered · " + Math.round(r.totals.accuracy * 100) +
+        "% correct · level " + r.totals.difficulty + "/5</p><table><tr><th>Subtopic</th><th>Confidence</th><th></th><th>Right/seen</th></tr>" + rows + "</table>" +
+        (misses ? "<h3>Recently missed</h3><ul>" + misses + "</ul>" : "") +
+        (r.weak.length ? '<div class="btns"><button class="btn" data-plan="' + esc(r.topic) + '">Make me a study plan</button></div><div id="plan-' + i + '"></div>'
+                       : '<div class="note good">No weak spots right now. Nice work.</div>') + "</div>";
+    }).join("");
+    el.querySelectorAll("[data-plan]").forEach((b, i) => {
+      b.onclick = async () => { busy(b, true); await streamTo("/api/review/plan", {topic: b.dataset.plan}, b.parentNode.nextElementSibling); busy(b, false); };
+    });
+  } catch (e) { el.innerHTML = '<div class="card"></div>'; note(el.firstChild, "bad", e.message); }
+}
+
+// ---------- assignments ----------
+async function loadAssignments() {
+  $("assign-detail").classList.add("hidden");
+  $("assign-list-view").classList.remove("hidden");
+  const d = await api("/api/assignments");
+  $("assign-list").innerHTML = d.assignments.length ? d.assignments.map((a) =>
+    '<div class="list-item"><div><b>' + esc(a.title) + '</b><div class="muted">' + esc([a.course, a.due ? "due " + a.due : ""].filter(Boolean).join(" · ")) +
+    "</div></div><button class=\"btn secondary\" data-open=\"" + esc(a.id) + '">Open</button></div>').join("")
+    : '<p class="muted">No assignments yet. Add one and paste in the brief.</p>';
+}
+$("assign-list").addEventListener("click", (e) => { if (e.target.dataset.open) openAssignment(e.target.dataset.open); });
+$("assign-new").onclick = () => { $("assign-form").classList.remove("hidden"); $("af-title").focus(); };
+$("af-cancel").onclick = () => $("assign-form").classList.add("hidden");
+$("af-save").onclick = async () => {
+  try {
+    const d = await api("/api/assignments", {title: $("af-title").value, course: $("af-course").value, due: $("af-due").value,
+                                             brief: $("af-brief").value, rubric: $("af-rubric").value});
+    ["af-title", "af-course", "af-due", "af-brief", "af-rubric"].forEach((id) => ($(id).value = ""));
+    $("assign-form").classList.add("hidden");
+    $("af-msg").innerHTML = "";
+    openAssignment(d.assignment.id);
+  } catch (e) { note($("af-msg"), "bad", e.message); }
+};
+async function openAssignment(id) {
+  const d = await api("/api/assignments/" + encodeURIComponent(id));
+  ASSIGN = d.assignment; LESSON = null;
+  $("assign-list-view").classList.add("hidden");
+  $("assign-detail").classList.remove("hidden");
+  $("ad-title").textContent = ASSIGN.title;
+  $("ad-meta").textContent = [ASSIGN.course, ASSIGN.due ? "due " + ASSIGN.due : ""].filter(Boolean).join(" · ");
+  $("ad-brief-text").innerHTML = "<h3>Brief</h3>" + md(ASSIGN.brief_text) + (ASSIGN.rubric_text ? "<h3>Rubric</h3>" + md(ASSIGN.rubric_text) : "");
+  $("aw-out").innerHTML = ""; $("aq-msg").innerHTML = ""; $("ad-lesson").classList.add("hidden");
+  renderSaved();
+  showSub("learn");
+  loadConcepts(false);
+}
+function renderSaved() {
+  const bits = [];
+  if (ASSIGN.outline) bits.push('<details><summary>Your outline</summary><div class="out">' + md(ASSIGN.outline) + "</div></details>");
+  (ASSIGN.drafts || []).slice().reverse().forEach((d) => bits.push('<details><summary>Feedback from ' + esc(d.ts.replace("T", " ")) +
+    '</summary><div class="out">' + md(d.feedback) + "</div></details>"));
+  $("aw-saved").innerHTML = bits.join("") || "Nothing saved yet.";
+}
+async function loadConcepts(refresh) {
+  const el = $("ad-concepts");
+  el.innerHTML = '<p class="thinking"></p>';
+  try {
+    const d = await api("/api/assignments/" + ASSIGN.id + "/concepts", {refresh: refresh});
+    ASSIGN.concepts = d.concepts;
+    el.innerHTML = d.concepts.map((c, i) => '<div class="list-item"><div><b>' + esc(c.name) + '</b><div class="muted">' + esc(c.why) +
+      '</div></div><button class="btn secondary" data-learn="' + i + '">Teach me</button></div>').join("") +
+      '<div class="btns"><button class="btn secondary" id="ad-reconcepts">Re-analyse the brief</button></div>';
+    $("ad-reconcepts").onclick = () => loadConcepts(true);
+  } catch (e) { note(el, "bad", e.message); }
+}
+$("ad-concepts").addEventListener("click", async (e) => {
+  const i = e.target.dataset.learn;
+  if (i === undefined) return;
+  LESSON = {concept: +i, history: []};
+  $("ad-lesson").classList.remove("hidden");
+  const out = $("ad-lesson-out");
+  out.innerHTML = "<h3>" + esc(ASSIGN.concepts[i].name) + "</h3>";
+  const text = await streamTo("/api/assignments/" + ASSIGN.id + "/learn", {concept: +i}, out, true);
+  if (text) LESSON.history.push({role: "assistant", content: text});
+});
+async function askFollowup() {
+  const q = $("ad-follow").value.trim();
+  if (!q || !LESSON) return;
+  $("ad-follow").value = "";
+  const out = $("ad-lesson-out");
+  out.insertAdjacentHTML("beforeend", '<div class="me">' + esc(q) + "</div>");
+  busy($("ad-follow-go"), true);
+  const text = await streamTo("/api/assignments/" + ASSIGN.id + "/followup", {concept: LESSON.concept, history: LESSON.history, question: q}, out, true);
+  if (text) LESSON.history.push({role: "user", content: q}, {role: "assistant", content: text});
+  busy($("ad-follow-go"), false);
+}
+$("ad-follow-go").onclick = askFollowup;
+$("ad-follow").addEventListener("keydown", (e) => { if (e.key === "Enter") askFollowup(); });
+
+async function coach(btn, action, body, after) {
+  busy(btn, true);
+  const text = await streamTo("/api/assignments/" + ASSIGN.id + "/" + action, body, $("aw-out"));
+  busy(btn, false);
+  if (text && after) after(text);
+}
+$("aw-plan").onclick = (e) => coach(e.target, "outline", {}, (t) => { ASSIGN.outline = t; renderSaved(); });
+$("aw-hint").onclick = (e) => { if ($("aw-stuck").value.trim()) coach(e.target, "hint", {stuck: $("aw-stuck").value}); };
+$("aw-feedback").onclick = (e) => {
+  const draft = $("aw-draft").value;
+  if (draft.trim()) coach(e.target, "feedback", {draft: draft}, (t) => {
+    ASSIGN.drafts = (ASSIGN.drafts || []).concat([{text: draft, feedback: t, ts: new Date().toISOString().slice(0, 19)}]);
+    renderSaved();
+  });
+};
+$("aq-go").onclick = () => { showTab("quiz"); startQuiz("assignment-" + ASSIGN.id); };
+$("aq-gen").onclick = async () => {
+  const btn = $("aq-gen");
+  busy(btn, true);
+  $("aq-msg").innerHTML = '<p class="thinking"></p>';
+  try {
+    const r = await fetch("/api/generate", {method: "POST", headers: {"Content-Type": "application/json"},
+                                            body: JSON.stringify({topic: "assignment-" + ASSIGN.id, n: 5})});
+    if (!r.ok) { const d = await r.json().catch(() => ({})); throw new Error(d.error || ("HTTP " + r.status)); }
+    const lines = (await r.text()).trim().split("\n").map((l) => JSON.parse(l));
+    const last = lines[lines.length - 1];
+    if (last.error) throw new Error(last.error);
+    note($("aq-msg"), "good", "Added " + last.result.added + " questions (" + last.result.total + " in this assignment's bank).");
+  } catch (e) { note($("aq-msg"), "bad", e.message); }
+  busy(btn, false);
+};
+$("ad-back").onclick = loadAssignments;
+$("ad-delete").onclick = async () => {
+  if (!confirm("Delete this assignment and its saved drafts?")) return;
+  await api("/api/assignments/" + ASSIGN.id, null, "DELETE");
+  loadAssignments();
+};
+function showSub(name) {
+  document.querySelectorAll("#ad-nav button").forEach((b) => b.classList.toggle("active", b.dataset.sub === name));
+  ["learn", "write", "aquiz", "brief"].forEach((s) => $("ad-" + s).classList.toggle("hidden", s !== name));
+}
+$("ad-nav").addEventListener("click", (e) => { if (e.target.dataset.sub) showSub(e.target.dataset.sub); });
+
+// ---------- settings ----------
+function fillSettings() {
+  const sel = $("set-provider");
+  sel.innerHTML = Object.keys(STATUS.providers).map((k) => '<option value="' + k + '">' + esc(STATUS.providers[k].label) + "</option>").join("");
+  sel.value = STATUS.provider;
+  onProvider(true);
+}
+function onProvider(initial) {
+  const k = $("set-provider").value, p = STATUS.providers[k], same = k === STATUS.provider;
+  $("set-url").value = same && initial ? STATUS.url : p.url;
+  $("set-model").value = same && initial ? STATUS.model : p.model;
+  $("set-url-wrap").classList.toggle("hidden", k !== "custom");
+  $("set-model-wrap").classList.toggle("hidden", k === "local");
+  $("set-key-wrap").classList.toggle("hidden", !p.needs_key);
+  $("set-key").value = "";
+  $("set-key").placeholder = same && STATUS.has_key ? "Saved. Leave blank to keep it." : "Paste your key";
+  $("set-keylink").innerHTML = p.key_url ? 'Get a free key at <a href="' + esc(p.key_url) + '" target="_blank" rel="noopener">' + esc(p.key_url) + "</a>" :
+    (k === "local" ? "Make sure llama-server is running (see README)." : "");
+  $("set-msg").innerHTML = "";
+}
+$("set-provider").onchange = () => onProvider(false);
+$("set-save").onclick = async () => {
+  try {
+    STATUS = await api("/api/settings", {provider: $("set-provider").value, url: $("set-url").value,
+                                         model: $("set-model").value, api_key: $("set-key").value});
+    await loadStatus();
+    onProvider(true);
+    note($("set-msg"), "good", "Saved. Now using " + STATUS.label + ".");
+  } catch (e) { note($("set-msg"), "bad", e.message); }
+};
+$("set-check").onclick = async () => {
+  $("set-msg").innerHTML = '<p class="thinking"></p>';
+  try { note($("set-msg"), "good", (await api("/api/check", {})).message); }
+  catch (e) { note($("set-msg"), "bad", e.message); }
+};
+
+loadStatus().then(loadTopics).catch((e) => note($("quiz-setup-msg"), "bad", "Can't reach the app: " + e.message));
+</script>
+</body>
+</html>
