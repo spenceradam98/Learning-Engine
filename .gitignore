@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.venv/
+settings.json
+# Your personal data stays on your Mac (remove these lines to back it up in git).
+data/questions/*.json
+data/progress/*.json
+data/assignments/*.json
+*.broken
+*.tmp
+.DS_Store
+models/
