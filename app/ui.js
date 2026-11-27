@@ -7,13 +7,26 @@ const store = new E.Store(window.localStorage);
 let SETTINGS = E.loadSettings(store), QUIZ = null, ASSIGN = null, LESSON = null, MODELS = null;
 const assignments = new E.Assignments(store);
 // Shows "busy, trying again" while the AI client retries, so nothing looks frozen.
-function onRetry(n, total) {
+function onRetry(n, total, wait) {
   const b = $("busy-note");
   if (!n) { b.classList.add("hidden"); return; }
-  b.textContent = SETTINGS.label + " is busy or slow to answer. Trying again (" + n + " of " + total + ")...";
+  b.textContent = "The AI is busy or asked us to wait. Trying again" + (wait ? " in " + Math.round(wait) + " seconds" : "") +
+    " (" + n + " of " + total + ")...";
   b.classList.remove("hidden");
 }
-const llm = () => new E.LLM(SETTINGS, {onRetry});
+function onProgress(text, frac) {
+  const b = $("busy-note");
+  if (frac != null && frac >= 1) { b.classList.add("hidden"); return; }
+  b.textContent = text + (frac != null ? " " + Math.round(frac * 100) + "%" : "");
+  b.classList.remove("hidden");
+}
+// One AI client for the whole page, so Automatic remembers which option worked.
+let LLM_CACHE = null, LLM_FOR = "";
+function llm() {
+  const sig = JSON.stringify(SETTINGS);
+  if (!LLM_CACHE || LLM_FOR !== sig) { LLM_CACHE = E.makeLLM(SETTINGS, {onRetry, onProgress, store}); LLM_FOR = sig; }
+  return LLM_CACHE;
+}
 
 // ---------------------------------------------------------------- helpers ---
 function esc(s) {
@@ -102,7 +115,8 @@ function showTab(name) {
 $("nav").addEventListener("click", (e) => { if (e.target.dataset.tab) showTab(e.target.dataset.tab); });
 
 function showStatus() {
-  $("ai").textContent = E.isConfigured(SETTINGS) ? "AI: " + (SETTINGS.provider === "local" ? "local model" : SETTINGS.model) : "AI: not set up yet";
+  $("ai").textContent = !E.isConfigured(SETTINGS) ? "AI: not set up yet" : SETTINGS.keyless ? "AI: " + SETTINGS.label
+    : "AI: " + (SETTINGS.provider === "local" ? "local model" : SETTINGS.model);
 }
 
 // --------------------------------------------------------- today & topics ---
@@ -471,44 +485,110 @@ function showSub(name) {
 $("ad-nav").addEventListener("click", (e) => { if (e.target.dataset.sub) showSub(e.target.dataset.sub); });
 
 // --------------------------------------------------------------- settings ---
-function providerKeys() {
-  return Object.keys(E.PROVIDERS).filter((k) => !E.PROVIDERS[k].localOnly || E.isLocalPage());
+const KEYLESS = ["auto", "chrome", "pollinations", "webllm"];
+const AI_TEXT = {
+  auto: "Recommended. Works straight away with no account or key. Uses Chrome's built-in AI if this computer has it, " +
+    "otherwise the private AI if you've downloaded it, otherwise the free shared AI. If one stops working it switches to the next.",
+  chrome: "Private: everything stays on this computer. Free, no account. Needs a recent Chrome on a newer computer " +
+    "(Google lists macOS 13+ or Windows 10/11 with 16 GB of memory).",
+  pollinations: "No account or key. Your questions and any assignment text are sent to Pollinations, a free public service " +
+    "run by a third party, with no guarantee it stays available. Slow: it lets each person send roughly one request every " +
+    "45 seconds, so a 10-question quiz can take several minutes. Generate questions ahead of time to avoid waits.",
+  webllm: "Private: downloads a small AI (about 1 GB) into this browser once, then runs on this computer, even offline. " +
+    "Needs a fairly recent computer and Chrome (WebGPU). Its answers are simpler and less accurate than the online AIs.",
+};
+let AI_STATUS = {};
+function advancedKeys() {
+  return Object.keys(E.PROVIDERS).filter((k) => !KEYLESS.includes(k) && (!E.PROVIDERS[k].localOnly || E.isLocalPage()));
 }
+async function refreshAIStatus() {
+  const chrome = await E.chromeAIStatus();
+  const gpu = await E.webgpuSupported();
+  const ready = (store.get("meta", {}) || {}).webllm_ready;
+  AI_STATUS = {
+    chrome: chrome === "available" ? ["good", "ready on this computer"] : chrome === "unavailable" ? ["bad", "not available on this computer"]
+      : ["", "Chrome needs a large one-time download first"],
+    webllm: ready ? ["good", "downloaded"] : gpu ? ["", "not downloaded yet"] : ["bad", "not supported on this computer"],
+    pollinations: ["", "slow, shared"],
+    auto: ["good", "no setup"],
+  };
+  AI_STATUS.chromeRaw = chrome; AI_STATUS.gpu = gpu;
+  renderAIOptions();
+}
+function renderAIOptions() {
+  const cur = SETTINGS.provider;
+  const rows = KEYLESS.map((k) => {
+    const st = AI_STATUS[k] || ["", ""];
+    const off = (k === "chrome" && AI_STATUS.chromeRaw === "unavailable") || (k === "webllm" && AI_STATUS.gpu === false);
+    return '<label class="ai-opt' + (cur === k ? " on" : "") + (off ? " off" : "") + '"><input type="radio" name="ai" value="' + k + '"' +
+      (cur === k ? " checked" : "") + (off ? " disabled" : "") + "><div><b>" + esc(E.PROVIDERS[k].label) + "</b>" +
+      (st[1] ? '<span class="tag ' + st[0] + '">' + esc(st[1]) + "</span>" : "") + '<p class="why">' + esc(AI_TEXT[k]) + "</p></div></label>";
+  });
+  const keyed = !KEYLESS.includes(cur);
+  rows.push('<label class="ai-opt' + (keyed ? " on" : "") + '"><input type="radio" name="ai" value="__own"' + (keyed ? " checked" : "") +
+    "><div><b>My own free key</b>" + (keyed ? '<span class="tag good">' + esc(SETTINGS.label) + "</span>" : "") +
+    '<p class="why">Fastest and most reliable. Takes about a minute to set up with a Google, Groq or OpenRouter account. Set it up under Advanced below.</p></div></label>');
+  $("ai-options").innerHTML = rows.join("");
+  $("webllm-box").classList.toggle("hidden", cur !== "webllm" || !!(store.get("meta", {}) || {}).webllm_ready);
+}
+$("ai-options").addEventListener("change", (e) => {
+  const k = e.target.value;
+  if (k === "__own") { $("adv").open = true; $("set-key").focus(); return; }
+  E.saveSettings(store, {provider: k});
+  SETTINGS = E.loadSettings(store);
+  showStatus();
+  renderAIOptions();
+  note($("set-msg"), "good", "Now using: " + SETTINGS.label + ".");
+});
+$("webllm-go").onclick = async () => {
+  const btn = $("webllm-go");
+  busy(btn, true);
+  $("webllm-bar").classList.remove("hidden");
+  try {
+    await new E.WebLLMClient({}, {store, onProgress: (text, frac) => { $("webllm-msg").textContent = text; if (frac != null) $("webllm-bar").value = frac; }}).engine();
+    $("webllm-msg").textContent = "Done. The private AI is ready and works offline from now on.";
+    refreshAIStatus();
+  } catch (e) { $("webllm-msg").textContent = e.message; }
+  $("webllm-bar").classList.add("hidden");
+  busy(btn, false);
+};
 function fillSettings() {
-  const sel = $("set-provider");
-  sel.innerHTML = providerKeys().map((k) => '<option value="' + k + '">' + esc(E.PROVIDERS[k].label) + "</option>").join("");
-  sel.value = providerKeys().includes(SETTINGS.provider) ? SETTINGS.provider : E.DEFAULT_PROVIDER;
-  $("welcome").hidden = E.isConfigured(SETTINGS);
+  const sel = $("set-provider"), keys = advancedKeys();
+  sel.innerHTML = keys.map((k) => '<option value="' + k + '">' + esc(E.PROVIDERS[k].label) + "</option>").join("");
+  const last = (store.get("settings", {}) || {}).lastKeyed;
+  sel.value = keys.includes(SETTINGS.provider) ? SETTINGS.provider : keys.includes(last) ? last : "gemini";
+  if (keys.includes(SETTINGS.provider)) $("adv").open = true;
+  renderAIOptions();
+  refreshAIStatus();
   onProvider(true);
   fillBackupInfo();
 }
 function currentForm() {
-  const k = $("set-provider").value, p = E.PROVIDERS[k];
+  const k = $("set-provider").value, p = E.PROVIDERS[k], saved = E.loadSettings(store, k);
   const typed = $("set-key").value.trim();
-  return {provider: k, label: p.label, needsKey: p.needsKey,
+  return {provider: k, label: p.label, needsKey: p.needsKey, kind: p.kind,
     url: k === "custom" ? $("set-url").value.trim() : p.url,
-    apiKey: typed || (k === SETTINGS.provider ? SETTINGS.apiKey : ""),
+    apiKey: typed || saved.apiKey,
     model: modelValue() || p.model};
 }
 function modelValue() {
   const pick = $("set-model-pick").value;
   return pick && pick !== "__type" ? pick : $("set-model").value.trim();
 }
-function onProvider(initial) {
-  const k = $("set-provider").value, p = E.PROVIDERS[k], same = k === SETTINGS.provider;
-  $("set-url").value = same ? (SETTINGS.provider === "custom" ? SETTINGS.url : "") : "";
+function onProvider() {
+  const k = $("set-provider").value, p = E.PROVIDERS[k], saved = E.loadSettings(store, k);
+  $("set-url").value = k === "custom" ? saved.url : "";
   $("set-url-wrap").classList.toggle("hidden", k !== "custom");
   $("set-model-wrap").classList.toggle("hidden", k === "local");
   $("set-key-wrap").classList.toggle("hidden", !p.needsKey);
   $("set-key").value = "";
-  $("set-key").placeholder = same && SETTINGS.apiKey ? "Saved in this browser. Leave blank to keep it." : "Paste your key";
+  $("set-key").placeholder = saved.apiKey ? "Saved in this browser. Leave blank to keep it." : "Paste your key";
   $("set-keylink").innerHTML = p.keyUrl ? 'Get a free key at <a href="' + esc(p.keyUrl) + '" target="_blank" rel="noopener">' + esc(p.keyUrl) + "</a>" :
     (k === "local" ? "Make sure llama-server is running (see README)." : "");
-  $("set-msg").innerHTML = "";
+  $("adv-msg").innerHTML = "";
   MODELS = null;
-  setModelChoices(null, same ? SETTINGS.model : p.model);
+  setModelChoices(null, saved.model || p.model);
   if (k !== "local") loadModels(true);
-  if (!initial) $("set-msg").innerHTML = "";
 }
 function setModelChoices(models, want) {
   const sel = $("set-model-pick");
@@ -537,39 +617,45 @@ async function loadModels(quiet) {
     setModelChoices(MODELS, modelValue() || f.model);
     msg.textContent = MODELS.length + " models available. Pick one, or keep the suggested one.";
   } catch (e) {
-    msg.textContent = (quiet ? "" : "") + e.message + " You can type a model name instead.";
+    msg.textContent = e.message + " You can type a model name instead.";
     if (!quiet) { $("set-model-pick").value = "__type"; $("set-model-type-wrap").classList.remove("hidden"); }
   }
 }
 $("set-load-models").onclick = () => loadModels(false);
 $("set-key").addEventListener("change", () => loadModels(true));
 $("set-url").addEventListener("change", () => loadModels(true));
-$("set-provider").onchange = () => onProvider(false);
+$("set-provider").onchange = () => onProvider();
 $("set-save").onclick = () => {
   const f = currentForm();
-  if (f.provider === "custom" && !/^https?:\/\//.test(f.url)) { note($("set-msg"), "bad", "Enter the API address (it starts with https://)."); return; }
-  if (f.needsKey && !f.apiKey) { note($("set-msg"), "bad", "Paste your API key first."); return; }
+  if (f.provider === "custom" && !/^https?:\/\//.test(f.url)) { note($("adv-msg"), "bad", "Enter the API address (it starts with https://)."); return; }
+  if (f.needsKey && !f.apiKey) { note($("adv-msg"), "bad", "Paste your API key first."); return; }
   try {
     E.saveSettings(store, f);
+    store.set("settings", Object.assign(store.get("settings", {}), {lastKeyed: f.provider}));
     SETTINGS = E.loadSettings(store);
     showStatus();
-    $("welcome").hidden = true;
     $("banner").innerHTML = "";
-    onProvider(true);
-    note($("set-msg"), "good", "Saved. Now using " + SETTINGS.label + " · " + SETTINGS.model + ". Click Test connection to check it works.");
-  } catch (e) { note($("set-msg"), "bad", e.message); }
+    onProvider();
+    renderAIOptions();
+    note($("adv-msg"), "good", "Saved. Now using " + SETTINGS.label + " · " + SETTINGS.model + ". Click Test the AI to check it works.");
+  } catch (e) { note($("adv-msg"), "bad", e.message); }
 };
 $("set-check").onclick = async () => {
   thinking($("set-msg"));
-  try { note($("set-msg"), "good", await new E.LLM(currentForm(), {onRetry}).check()); } catch (e) { note($("set-msg"), "bad", e.message); }
+  try { note($("set-msg"), "good", await llm().check()); } catch (e) { note($("set-msg"), "bad", e.message); }
+  onRetry(0);
 };
 $("set-forget").onclick = () => {
-  if (!confirm("Remove your API key from this browser? Your work stays.")) return;
-  E.saveSettings(store, Object.assign({}, SETTINGS, {apiKey: ""}));
+  const k = $("set-provider").value;
+  if (!confirm("Remove your " + E.PROVIDERS[k].label + " key from this browser? Your work stays.")) return;
+  const saved = E.loadSettings(store, k);
+  const was = SETTINGS.provider;
+  E.saveSettings(store, Object.assign({}, saved, {provider: k, apiKey: ""}));
+  E.saveSettings(store, {provider: was === k ? "auto" : was});  // switch back to no-setup if that key was in use
   SETTINGS = E.loadSettings(store);
   showStatus();
   fillSettings();
-  note($("set-msg"), "good", "Key removed from this browser.");
+  note($("adv-msg"), "good", "Key removed from this browser." + (was === k ? " Switched to Automatic (no setup)." : ""));
 };
 
 // ------------------------------------------------------------ backups ---
@@ -649,7 +735,12 @@ showStatus();
 loadToday();
 loadTopics();
 if (!E.isConfigured(SETTINGS)) {
-  showTab("settings");
+  showTab("settings");  // an own-key service with its key removed
+} else if (!(store.get("meta", {}) || {}).welcomed) {
+  store.set("meta", Object.assign(store.get("meta", {}) || {}, {welcomed: E.nowIso()}));
+  if (SETTINGS.provider === "auto")
+    showBanner("good", "Welcome! No setup needed: the app uses a free AI automatically. Pick a topic and start a quiz. " +
+      "(The free shared AI can be slow. For faster answers, add your own free key in Settings.)");
 } else {
   maybeRemindBackup();
 }

@@ -76,3 +76,12 @@ summary { cursor: pointer; }
 code.link { word-break: break-all; background: var(--chip); padding: 4px 8px; border-radius: 6px; display: inline-block; }
 label.btn { display: inline-block; margin: 0; background: var(--chip); color: var(--text); border-radius: 8px;
             padding: 9px 16px; font-size: 16px; font-weight: 600; cursor: pointer; }
+.ai-opt { display: flex; gap: 12px; align-items: flex-start; padding: 12px; margin: 8px 0; border: 1px solid var(--line);
+          border-radius: 10px; cursor: pointer; background: var(--bg); }
+.ai-opt.on { border-color: var(--accent); }
+.ai-opt input { width: auto; margin-top: 4px; }
+.ai-opt .why { font-size: 14px; color: var(--muted); margin: 2px 0 0; }
+.ai-opt .tag { font-size: 12px; padding: 1px 8px; border-radius: 999px; background: var(--chip); margin-left: 6px; }
+.ai-opt .tag.good { background: var(--good-bg); color: var(--good); }
+.ai-opt .tag.bad { background: var(--bad-bg); color: var(--bad); }
+.ai-opt.off { opacity: .6; cursor: default; }

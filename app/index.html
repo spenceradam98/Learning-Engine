@@ -3,8 +3,9 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<!-- Only this site's own scripts may run. Network calls go to the AI service you pick. -->
-<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' https: http://localhost:* http://127.0.0.1:*; manifest-src 'self'; worker-src 'self'; base-uri 'none'; form-action 'none'; object-src 'none'">
+<!-- Only this site's own scripts may run, plus the pinned private-AI library from jsDelivr
+     (loaded only if you choose "Private AI on this computer"). Network calls go to the AI you pick. -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://esm.run https://cdn.jsdelivr.net 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' https: http://localhost:* http://127.0.0.1:*; manifest-src 'self'; worker-src 'self'; base-uri 'none'; form-action 'none'; object-src 'none'">
 <meta name="referrer" content="no-referrer">
 <title>Learning Engine</title>
 <meta name="description" content="An adaptive tutor for MIDI, sound principles, live sound and your own assignments.">
@@ -154,35 +155,37 @@
 
   <!-- SETTINGS -->
   <section id="tab-settings" class="hidden">
-    <div class="card" id="welcome" hidden>
-      <h2>Welcome! One quick step first</h2>
-      <p>This app uses a free AI service to make questions and explain things. You need your own free key. It takes about a minute:</p>
-      <ol class="steps">
-        <li>Open <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">Google AI Studio</a> and sign in with a Google account.</li>
-        <li>Click <b>Create API key</b>, then <b>Copy</b>.</li>
-        <li>Paste it into <b>API key</b> below and click <b>Save</b>.</li>
-      </ol>
-      <p class="muted">Your key stays in this browser only. It is never sent anywhere except to the AI service you pick.</p>
-    </div>
     <div class="card">
-      <h2>AI settings</h2>
-      <label for="set-provider">AI service</label><select id="set-provider"></select>
-      <p id="set-keylink" class="muted"></p>
-      <div id="set-url-wrap"><label for="set-url">API address</label><input id="set-url" placeholder="https://.../v1/chat/completions"></div>
-      <div id="set-key-wrap"><label for="set-key">API key</label><input id="set-key" type="password" autocomplete="off" spellcheck="false"></div>
-      <div id="set-model-wrap">
-        <label for="set-model-pick">Model</label>
-        <div class="row" style="align-items:center">
-          <div><select id="set-model-pick"></select></div>
-          <div style="flex:0 0 auto"><button class="btn secondary" id="set-load-models">Refresh list</button></div>
-        </div>
-        <div id="set-model-type-wrap" class="hidden"><label for="set-model">Model name</label><input id="set-model" spellcheck="false"></div>
-        <p id="set-model-msg" class="muted"></p>
+      <h2>Choose your AI</h2>
+      <p class="muted">The app needs an AI to write questions and explain things. The first options work straight away: no account, no key.</p>
+      <div id="ai-options" role="radiogroup" aria-label="AI options"></div>
+      <div id="webllm-box" class="hidden">
+        <div class="btns"><button class="btn" id="webllm-go">Download the private AI now</button></div>
+        <progress id="webllm-bar" class="hidden" value="0" max="1"></progress>
+        <p id="webllm-msg" class="muted"></p>
       </div>
-      <div class="btns"><button class="btn" id="set-save">Save</button><button class="btn secondary" id="set-check">Test connection</button>
-        <button class="btn secondary" id="set-forget">Remove my key from this browser</button></div>
+      <div class="btns"><button class="btn secondary" id="set-check">Test the AI</button></div>
       <div id="set-msg"></div>
-      <p class="muted">Your questions and any assignment text you paste are sent to the AI service you choose. If it says it's busy, the app waits and tries again a few times automatically.</p>
+      <details id="adv" style="margin-top:16px">
+        <summary><b>Advanced: use your own free key</b> <span class="muted">(faster and more reliable)</span></summary>
+        <p class="muted">Free keys from Google Gemini, Groq or OpenRouter make the app much faster. Your key stays in this browser only and is sent only to the service you pick.</p>
+        <label for="set-provider">AI service</label><select id="set-provider"></select>
+        <p id="set-keylink" class="muted"></p>
+        <div id="set-url-wrap"><label for="set-url">API address</label><input id="set-url" placeholder="https://.../v1/chat/completions"></div>
+        <div id="set-key-wrap"><label for="set-key">API key</label><input id="set-key" type="password" autocomplete="off" spellcheck="false"></div>
+        <div id="set-model-wrap">
+          <label for="set-model-pick">Model</label>
+          <div class="row" style="align-items:center">
+            <div><select id="set-model-pick"></select></div>
+            <div style="flex:0 0 auto"><button class="btn secondary" id="set-load-models">Refresh list</button></div>
+          </div>
+          <div id="set-model-type-wrap" class="hidden"><label for="set-model">Model name</label><input id="set-model" spellcheck="false"></div>
+          <p id="set-model-msg" class="muted"></p>
+        </div>
+        <div class="btns"><button class="btn" id="set-save">Use this service</button>
+          <button class="btn secondary" id="set-forget">Remove my key from this browser</button></div>
+        <div id="adv-msg"></div>
+      </details>
     </div>
     <div class="card">
       <h2>Your work</h2>
@@ -203,7 +206,7 @@
       <p>Send them this link. They just open it in Chrome. Nothing to install, no Terminal.</p>
       <p><code class="link" id="share-link"></code></p>
       <div class="btns"><button class="btn secondary" id="share-copy">Copy link</button></div>
-      <p class="muted">Each person adds their own free key and their work stays in their own browser, so nobody sees anyone else's work or uses anyone else's key.</p>
+      <p class="muted">It works straight away with no account or key. Each person's work stays in their own browser, so nobody sees anyone else's work. Anyone who adds their own key keeps it to themselves.</p>
       <h3>Install it like an app</h3>
       <p class="muted">In Chrome, click the install icon at the right of the address bar (a screen with a down arrow), or the <b>Install app</b> button at the top of this page. It then opens in its own window from your Dock or Start menu.</p>
     </div>

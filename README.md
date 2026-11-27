@@ -13,15 +13,27 @@ It runs **online in Chrome** (nothing to install, easy to share), or on your Mac
 
 Open **https://spenceradam98.github.io/Learning-Engine/** in Chrome.
 
-1. The first time, the Settings page shows how to get a free Google Gemini key (about a minute). Paste it and click **Save**. The model list fills in by itself; the suggested model is fine.
+1. It works straight away: no account, no key. Pick a topic and start a quiz. The app uses a free AI automatically (see **Choosing the AI** below).
 2. To install it like an app, click the install icon at the right of Chrome's address bar, or the **Install app** button at the top of the page.
 3. To share it, send people the link above (it's also under Settings, with a **Copy link** button).
 
 Good to know:
 
-- **Each person uses their own free key**, kept only in their own browser. It is never put on the website or shared.
+- Nobody needs an account. Anyone who adds their own key (optional, under Settings > Advanced) keeps it in their own browser; it is never put on the website or shared.
 - **Your work saves automatically in your browser**: progress, question banks, assignments, drafts, notes and lessons. Nobody else can see it. It stays on that computer and in that browser, so use **Settings > Download a backup** now and then, and **Restore from a backup** to move it to another computer.
 - If the AI says it's busy, the app waits and tries again a few times by itself. If it still fails, wait a minute or pick another model or service in Settings.
+
+### Choosing the AI
+
+In **Settings > Choose your AI**:
+
+| Option | Setup | Privacy | Speed and quality |
+|---|---|---|---|
+| **Automatic** (default) | None | Uses the most private option available | Picks Chrome's built-in AI, then the private AI if downloaded, then the free shared AI, and switches if one fails |
+| **Chrome's built-in AI** | None, on computers that have it | Stays on your computer | Good and fast, but needs a recent Chrome on a newer computer (macOS 13+ or Windows 10/11, 16 GB memory) |
+| **Free shared AI** (Pollinations) | None | Text is sent to Pollinations, a free third-party service | Slow: about one request every 45 seconds per person. No guarantee it stays available |
+| **Private AI on this computer** | One-time download, about 1 GB | Stays on your computer, works offline | Needs WebGPU (recent Chrome, most computers from about 2016). Simpler, less accurate answers |
+| **Your own free key** (Gemini, Groq, OpenRouter) | About a minute, needs an account | Text is sent to that service | Fastest and most reliable |
 
 ### Putting it online (Adam, one time only)
 

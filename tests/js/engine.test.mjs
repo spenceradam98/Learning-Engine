@@ -227,3 +227,102 @@ test("a stream that goes quiet stops with a message", async () => {
   const llm = new E.LLM(gemini(), {fetch: async () => ({status: 200, ok: true, headers: {get: () => null}, body}), idleSec: 0.05});
   await assert.rejects((async () => { for await (const c of llm.stream([{role: "user", content: "hi"}])) void c; })(), /stopped answering/);
 });
+
+// ---- no-setup AI options ----
+test("new users start on Automatic, which needs no key", () => {
+  const s = E.loadSettings(new E.Store());
+  assert.equal(s.provider, "auto");
+  assert.ok(E.isConfigured(s));
+});
+
+test("old single-service settings still load, and keys are kept per service", () => {
+  const st = new E.Store();
+  st.set("settings", {provider: "gemini", url: "", model: "gemini-2.5-flash", apiKey: "old-key"});
+  assert.equal(E.loadSettings(st).apiKey, "old-key");
+  E.saveSettings(st, {provider: "auto"});
+  assert.equal(E.loadSettings(st).provider, "auto");
+  assert.equal(E.loadSettings(st, "gemini").apiKey, "old-key");  // not lost by switching
+});
+
+test("free shared AI: no model or key sent, waits when asked (402 + Retry-After), whole answers", async () => {
+  const sent = [], waits = [];
+  const replies = [fakeResponse(402, {error: "slow down"}, {"Retry-After": "40"}),
+    fakeResponse(200, {choices: [{message: {content: "Hello there"}}]})];
+  const llm = E.makeLLM(E.loadSettings(new E.Store(), "pollinations"),
+    {fetch: async (u, o) => { sent.push([u, o]); return replies.shift(); }, sleep: async (s) => waits.push(s)});
+  let out = "";
+  for await (const c of llm.stream([{role: "user", content: "hi"}])) out += c;
+  assert.equal(out, "Hello there");
+  assert.equal(sent[0][0], "https://text.pollinations.ai/openai");
+  const body = JSON.parse(sent[0][1].body);
+  assert.equal(body.model, undefined);
+  assert.equal(body.stream, false);
+  assert.equal(sent[0][1].headers.Authorization, undefined);
+  assert.deepEqual(waits, [40]);
+});
+
+test("free shared AI explains when it stays busy", async () => {
+  const llm = E.makeLLM(E.loadSettings(new E.Store(), "pollinations"), {fetch: async () => fakeResponse(402, {}), sleep: async () => {}});
+  await assert.rejects(llm.chat([{role: "user", content: "hi"}]), /busy with other people/);
+});
+
+function fakeChrome(status, reply) {
+  const made = [];
+  return {made, LanguageModel: {
+    availability: async () => status,
+    create: async (o) => { made.push(o); return {prompt: async (p) => reply + ":" + p, promptStreaming: async function* () { yield reply; yield "!"; }, destroy() {}}; },
+  }};
+}
+
+test("Chrome's built-in AI: system and history go in initialPrompts, last message is the prompt", async () => {
+  const g = fakeChrome("available", "nano");
+  assert.equal(await E.chromeAIStatus(g), "available");
+  assert.equal(await E.chromeAIStatus({}), "unavailable");
+  const llm = new E.ChromeLLM({}, {global: g});
+  const out = await llm.chat([{role: "system", content: "S"}, {role: "assistant", content: "A"}, {role: "user", content: "Q"}]);
+  assert.equal(out, "nano:Q");
+  assert.deepEqual(g.made[0].initialPrompts, [{role: "system", content: "S"}, {role: "assistant", content: "A"}]);
+  let streamed = "";
+  for await (const c of llm.stream([{role: "user", content: "x"}])) streamed += c;
+  assert.equal(streamed, "nano!");
+});
+
+test("Automatic prefers Chrome's AI when this computer has it, else the shared AI", async () => {
+  const g = fakeChrome("available", "nano");
+  const auto = E.makeLLM(E.loadSettings(new E.Store()), {global: g, store: new E.Store(),
+    fetch: async () => { throw new Error("should not call the shared AI"); }});
+  assert.ok(auto instanceof E.AutoLLM);
+  assert.equal(await auto.chat([{role: "user", content: "Q"}]), "nano:Q");
+  assert.equal(auto.describe(), "Chrome's built-in AI");
+  const auto2 = E.makeLLM(E.loadSettings(new E.Store()), {global: fakeChrome("unavailable", "x"), store: new E.Store(),
+    fetch: async () => fakeResponse(200, {choices: [{message: {content: "shared"}}]})});
+  assert.equal(await auto2.chat([{role: "user", content: "Q"}]), "shared");
+  assert.match(auto2.describe(), /Pollinations/);
+});
+
+test("Automatic falls back to the next option when one fails", async () => {
+  const bad = {chat: async () => { throw new E.LLMError("down"); }, async *stream() { throw new E.LLMError("down"); }, describe: () => "bad"};
+  const good = {chat: async () => "ok", async *stream() { yield "o"; yield "k"; }, describe: () => "good"};
+  const auto = new E.AutoLLM({}, {candidates: [bad, good]});
+  assert.equal(await auto.chat([{role: "user", content: "Q"}]), "ok");
+  assert.equal(auto.describe(), "good");
+  let s = "";
+  for await (const c of new E.AutoLLM({}, {candidates: [bad, good]}).stream([{role: "user", content: "Q"}])) s += c;
+  assert.equal(s, "ok");
+  const allBad = new E.AutoLLM({}, {candidates: [bad]});
+  await assert.rejects(allBad.chat([{role: "user", content: "Q"}]), /down/);
+});
+
+test("quizzes work end to end on Automatic with JSON questions", async () => {
+  const store = new E.Store();
+  const q = JSON.stringify({question: "Which message starts a MIDI note?", choices: ["Note On", "Note Off", "CC", "Clock"], answer_index: 0, explanation: "Note On starts it."});
+  const llm = E.makeLLM(E.loadSettings(store), {global: {}, store, fetch: async () => fakeResponse(200, {choices: [{message: {content: q}}]})});
+  const s = new E.QuizSession(store, llm, "midi", 1);
+  const got = await s.next();
+  assert.equal(got.choices[0], "Note On");
+});
+
+test("private AI says clearly when the computer can't run it", async () => {
+  const c = new E.WebLLMClient({}, {importer: async () => { throw new Error("no"); }});
+  await assert.rejects(c.chat([{role: "user", content: "hi"}]), /can't run the private AI|WebGPU/);
+});

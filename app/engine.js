@@ -4,11 +4,28 @@
 // This mirrors the Python engine in ../engine (same data format), so backups
 // move between the two.
 
-export const APP_VERSION = "2.0.1";
+export const APP_VERSION = "2.1.0";
 
 // ---------------------------------------------------------------- settings ---
 
+// "kind" says how we talk to it: "http" (OpenAI-style web API), "chrome"
+// (Chrome's built-in Gemini Nano), "webllm" (a model downloaded into the
+// browser) or "auto" (the best no-setup option that works, with fallbacks).
 export const PROVIDERS = {
+  auto: {
+    kind: "auto", label: "Automatic (no setup)", url: "", model: "", needsKey: false, keyless: true,
+  },
+  chrome: {
+    kind: "chrome", label: "Chrome's built-in AI", url: "", model: "Gemini Nano", needsKey: false, keyless: true,
+  },
+  pollinations: {
+    kind: "http", label: "Free shared AI (Pollinations)",
+    url: "https://text.pollinations.ai/openai", model: "", needsKey: false, keyless: true, slow: true,
+  },
+  webllm: {
+    kind: "webllm", label: "Private AI on this computer", url: "", model: "Qwen2.5-1.5B-Instruct-q4f16_1-MLC",
+    needsKey: false, keyless: true,
+  },
   gemini: {
     label: "Google Gemini (free tier)",
     url: "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
@@ -33,7 +50,7 @@ export const PROVIDERS = {
     localOnly: true,
   },
 };
-export const DEFAULT_PROVIDER = "gemini";
+export const DEFAULT_PROVIDER = "auto";
 
 export const TOPICS = {
   midi: {
@@ -149,22 +166,34 @@ export function isLocalPage(loc) {
   return h === "localhost" || h === "127.0.0.1";
 }
 
-export function loadSettings(store) {
+// Settings remember a key and model per service, so switching to a no-setup
+// option and back doesn't lose your key. Older single-service settings still load.
+export function loadSettings(store, providerOverride) {
   const s = store.get("settings", {}) || {};
-  const provider = PROVIDERS[s.provider] ? s.provider : DEFAULT_PROVIDER;
-  const p = PROVIDERS[provider];
+  const saved = Object.assign({}, s.saved || {});
+  if (s.provider && !s.saved && PROVIDERS[s.provider])
+    saved[s.provider] = {url: s.url || "", model: s.model || "", apiKey: s.apiKey || ""};
+  let provider = providerOverride || s.provider;
+  if (!PROVIDERS[provider]) provider = DEFAULT_PROVIDER;
+  const p = PROVIDERS[provider], mine = saved[provider] || {};
   return {
-    provider, label: p.label,
-    url: (provider === "custom" ? s.url : p.url) || p.url,
-    model: s.model || p.model,
-    apiKey: s.apiKey || "",
-    needsKey: p.needsKey,
+    provider, label: p.label, kind: p.kind,
+    url: (provider === "custom" ? mine.url : p.url) || p.url,
+    model: (p.kind === "http" && mine.model) || p.model,
+    apiKey: mine.apiKey || "",
+    needsKey: p.needsKey, keyless: !!p.keyless,
   };
 }
 export function saveSettings(store, s) {
-  store.set("settings", {provider: s.provider, url: s.url || "", model: s.model || "", apiKey: s.apiKey || ""});
+  const cur = store.get("settings", {}) || {};
+  const saved = Object.assign({}, cur.saved || {});
+  if (cur.provider && !cur.saved && PROVIDERS[cur.provider])
+    saved[cur.provider] = {url: cur.url || "", model: cur.model || "", apiKey: cur.apiKey || ""};
+  saved[s.provider] = {url: s.url || "", model: s.model || "", apiKey: s.apiKey || ""};
+  store.set("settings", {provider: s.provider, saved});
 }
 export function isConfigured(settings) {
+  if (settings.keyless) return true;
   return !!(settings.url && (!settings.needsKey || settings.apiKey));
 }
 
@@ -215,8 +244,13 @@ export class LLM {
     this.schemaOk = this.isLocal;
     this.reasoning = reasoningEffort(settings.provider, settings.model);
     this.onRetry = opts.onRetry || (() => {});  // (try number, of how many); 0 = done
+    // Free shared services ask you to wait between requests (HTTP 402/429 with
+    // Retry-After); allow longer waits and more tries for them.
+    this.shared = !!(PROVIDERS[settings.provider] || {}).slow;
+    this.delays = opts.delays || (this.shared ? [5, 15, 30, 45, 60] : BUSY_RETRY_DELAYS);
+    this.maxWait = this.shared ? 75 : 30;
   }
-  describe() { return this.isLocal ? "local model" : this.s.label + " · " + this.s.model; }
+  describe() { return this.isLocal ? "local model" : this.s.label + (this.s.model ? " · " + this.s.model : ""); }
   headers() {
     const h = {"Content-Type": "application/json"};
     if (this.s.apiKey) h.Authorization = "Bearer " + this.s.apiKey;
@@ -225,6 +259,11 @@ export class LLM {
   }
   payload(messages, temperature, maxTokens, stream, schema) {
     const p = {model: this.s.model || "local", messages, temperature, max_tokens: maxTokens, stream: !!stream};
+    if (this.shared) {
+      delete p.model;   // let the free service use its default free model
+      p.stream = false; // and ask for whole answers (streaming isn't documented there)
+      p.max_tokens = maxTokens + 1500;  // its default model reasons before answering
+    }
     if (this.s.provider === "gemini") p.max_tokens = maxTokens + 2048;  // room for any thinking
     if (this.reasoning) p.reasoning_effort = this.reasoning;
     if (schema && this.schemaOk) p.response_format = {type: "json_object", schema};
@@ -252,8 +291,8 @@ export class LLM {
   async post(payload) {
     if (!this.s.url) throw new LLMError("No AI chosen yet. Open Settings and pick one.");
     if (this.s.needsKey && !this.s.apiKey) throw new LLMError("No API key yet. Open Settings and paste your free key.");
-    const delays = BUSY_RETRY_DELAYS.slice();
-    const name = this.s.label + " (" + this.s.model + ")";
+    const delays = this.delays.slice(), total = this.delays.length;
+    const name = this.s.label + (this.s.model ? " (" + this.s.model + ")" : "");
     for (;;) {
       let r;
       try {
@@ -266,7 +305,7 @@ export class LLM {
         // A busy or rate-limited service sometimes answers in a way the browser
         // can only see as a dropped connection, so treat it like "busy": retry.
         if (delays.length) {
-          this.onRetry(BUSY_RETRY_DELAYS.length - delays.length + 1, BUSY_RETRY_DELAYS.length);
+          this.onRetry(total - delays.length + 1, total);
           await this.sleep(delays.shift());
           continue;
         }
@@ -277,11 +316,11 @@ export class LLM {
         throw this.offlineOr("Couldn't get an answer from " + name + ", even after a few tries. Usually this means the free service is " +
           "overloaded or your free daily limit is used up. Wait a minute and try again, or pick another model or service in Settings.");
       }
-      if ([429, 500, 502, 503, 504].includes(r.status) && delays.length) {
+      if ([402, 429, 500, 502, 503, 504].includes(r.status) && (r.status !== 402 || this.shared) && delays.length) {
         let wait = delays.shift();
         const ra = parseFloat((r.headers && r.headers.get && r.headers.get("Retry-After")) || "0");
-        if (ra > wait) wait = Math.min(30, ra);
-        this.onRetry(BUSY_RETRY_DELAYS.length - delays.length, BUSY_RETRY_DELAYS.length);
+        if (ra > wait) wait = Math.min(this.maxWait, ra);
+        this.onRetry(total - delays.length, total, wait);
         await this.sleep(wait);
         continue;
       }
@@ -305,6 +344,9 @@ export class LLM {
       if (r.status === 401 || r.status === 403 || (r.status === 400 && /api.?key/.test(low)))
         throw new LLMError("The AI service rejected your key. Copy it again from the provider's website, paste it in Settings and click Save." +
           (msg ? " (It said: " + msg + ")" : ""));
+      if (this.shared && (r.status === 402 || r.status === 429))
+        throw new LLMError("The free shared AI is busy with other people right now. Wait a minute and try again, " +
+          "or choose another option in Settings (your own free key is much faster).");
       if (r.status === 429)
         throw new LLMError("You've hit the free usage limit for " + name + ". Wait a minute (or until tomorrow for a daily limit), or pick another model in Settings." +
           (msg ? " (It said: " + msg + ")" : ""));
@@ -327,7 +369,16 @@ export class LLM {
   // Yields text chunks as the model writes them.
   async *stream(messages, opts) {
     opts = opts || {};
-    const r = await this.post(this.payload(messages, opts.temperature ?? 0.7, opts.maxTokens || 700, true));
+    const payload = this.payload(messages, opts.temperature ?? 0.7, opts.maxTokens || 700, true);
+    const r = await this.post(payload);
+    if (!payload.stream) {  // service answered in one go
+      let data;
+      try { data = await r.json(); } catch (e) { throw new LLMError("Unexpected reply from the AI service."); }
+      const text = (((data.choices || [])[0] || {}).message || {}).content || "";
+      if (!text) throw new LLMError("The AI sent an empty answer. Try again.");
+      yield text;
+      return;
+    }
     if (!r.body || !r.body.getReader) {  // no streaming support: return it in one go
       yield* parseSse(await r.text());
       return;
@@ -380,6 +431,195 @@ export class LLM {
     const reply = await this.chat([{role: "user", content: "Reply with the word OK."}], {temperature: 0, maxTokens: 20});
     return "Connected to " + this.describe() + ". It replied: " + (reply.trim().slice(0, 40) || "(an empty reply, but the connection works)");
   }
+}
+
+// ------------------------------------------------- no-setup AI options ---
+
+// Chrome's built-in AI (Gemini Nano): free, private (stays on the computer), no key.
+// Needs a recent Chrome on a fairly powerful computer (Google: macOS 13+ or
+// Windows 10/11, 16 GB RAM). Returns "available", "downloadable",
+// "downloading" or "unavailable".
+export async function chromeAIStatus(g) {
+  g = g || globalThis;
+  try {
+    if (!g.LanguageModel || !g.LanguageModel.availability) return "unavailable";
+    return await g.LanguageModel.availability({expectedInputs: [{type: "text", languages: ["en"]}],
+      expectedOutputs: [{type: "text", languages: ["en"]}]});
+  } catch (e) { return "unavailable"; }
+}
+
+function splitMessages(messages) {
+  const system = messages.filter((m) => m.role === "system").map((m) => m.content).join("\n\n");
+  const rest = messages.filter((m) => m.role !== "system");
+  const last = rest.pop() || {content: ""};
+  return {system, history: rest, prompt: last.content};
+}
+
+export class ChromeLLM extends LLM {
+  constructor(settings, opts) {
+    super(Object.assign({}, settings, {provider: "chrome", label: PROVIDERS.chrome.label, model: "Gemini Nano", url: "chrome"}), opts);
+    this.g = (opts && opts.global) || globalThis;
+    this.onProgress = (opts && opts.onProgress) || (() => {});
+  }
+  describe() { return "Chrome's built-in AI"; }
+  async session(messages) {
+    const LM = this.g.LanguageModel;
+    if (!LM) throw new LLMError("Chrome's built-in AI isn't available in this browser or on this computer.");
+    const {system, history, prompt} = splitMessages(messages);
+    const initialPrompts = (system ? [{role: "system", content: system}] : []).concat(history);
+    const onProgress = this.onProgress;
+    try {
+      const sess = await LM.create({
+        initialPrompts,
+        expectedInputs: [{type: "text", languages: ["en"]}], expectedOutputs: [{type: "text", languages: ["en"]}],
+        monitor(m) { m.addEventListener("downloadprogress", (e) => onProgress("Setting up Chrome's built-in AI (one-time download)", e.loaded)); },
+      });
+      return {sess, prompt};
+    } catch (e) {
+      throw new LLMError("Chrome's built-in AI couldn't start: " + ((e && e.message) || e));
+    }
+  }
+  async chat(messages) {
+    const {sess, prompt} = await this.session(messages);
+    try { return await sess.prompt(prompt); } catch (e) {
+      throw new LLMError("Chrome's built-in AI stopped: " + ((e && e.message) || e));
+    } finally { if (sess.destroy) sess.destroy(); }
+  }
+  async *stream(messages) {
+    const {sess, prompt} = await this.session(messages);
+    try {
+      for await (const chunk of sess.promptStreaming(prompt)) yield chunk;
+    } catch (e) {
+      throw new LLMError("Chrome's built-in AI stopped: " + ((e && e.message) || e));
+    } finally { if (sess.destroy) sess.destroy(); }
+  }
+}
+
+// A small open model downloaded once into the browser and run on the
+// computer's graphics chip (WebGPU). Private and free, but needs a download
+// of about 1 GB and a reasonably recent computer.
+export const WEBLLM_URL = "https://esm.run/@mlc-ai/web-llm@0.2.79";
+export const WEBLLM_MODELS = ["Qwen2.5-1.5B-Instruct-q4f16_1-MLC", "Llama-3.2-1B-Instruct-q4f16_1-MLC"];
+let webllmEngine = null, webllmModel = null;
+
+export async function webgpuSupported(g) {
+  g = g || globalThis;
+  try { return !!(g.navigator && g.navigator.gpu && await g.navigator.gpu.requestAdapter()); } catch (e) { return false; }
+}
+
+export async function webllmDownloaded(store) {
+  return !!(store && (store.get("meta", {}) || {}).webllm_ready);
+}
+
+export class WebLLMClient extends LLM {
+  constructor(settings, opts) {
+    super(Object.assign({}, settings, {provider: "webllm", label: PROVIDERS.webllm.label, url: "webllm"}), opts);
+    this.onProgress = (opts && opts.onProgress) || (() => {});
+    this.store = opts && opts.store;
+    this.importer = (opts && opts.importer) || ((url) => import(url));
+  }
+  describe() { return "private AI on this computer" + (webllmModel ? " (" + webllmModel.split("-q4")[0] + ")" : ""); }
+  async engine() {
+    if (webllmEngine) return webllmEngine;
+    if (!(await webgpuSupported())) throw new LLMError("This computer or browser can't run the private AI (it needs WebGPU, found in recent Chrome on most computers from about 2016 onwards).");
+    let lib;
+    try { lib = await this.importer(WEBLLM_URL); } catch (e) {
+      throw new LLMError("Couldn't load the private AI software. Check your internet connection and try again.");
+    }
+    let lastErr = null;
+    for (const model of WEBLLM_MODELS) {
+      try {
+        webllmEngine = await lib.CreateMLCEngine(model, {initProgressCallback: (p) =>
+          this.onProgress("Downloading the private AI (one time only): " + (p.text || ""), p.progress)});
+        webllmModel = model;
+        if (this.store) this.store.set("meta", Object.assign(this.store.get("meta", {}) || {}, {webllm_ready: model}));
+        return webllmEngine;
+      } catch (e) { lastErr = e; }
+    }
+    throw new LLMError("The private AI couldn't start on this computer: " + ((lastErr && lastErr.message) || lastErr));
+  }
+  async chat(messages, opts) {
+    opts = opts || {};
+    const eng = await this.engine();
+    const r = await eng.chat.completions.create({messages, temperature: opts.temperature ?? 0.7, max_tokens: opts.maxTokens || 700});
+    return ((r.choices || [])[0] || {}).message?.content || "";
+  }
+  async *stream(messages, opts) {
+    opts = opts || {};
+    const eng = await this.engine();
+    const chunks = await eng.chat.completions.create({messages, temperature: opts.temperature ?? 0.7, max_tokens: opts.maxTokens || 700, stream: true});
+    for await (const c of chunks) {
+      const t = c.choices && c.choices[0] && c.choices[0].delta && c.choices[0].delta.content;
+      if (t) yield t;
+    }
+  }
+}
+
+// "Automatic": tries the no-setup options best-first and falls back to the
+// next one if one isn't available or fails:
+//   1. Chrome's built-in AI, if this computer already has it (private, fast)
+//   2. the private downloaded AI, if it was downloaded before (private)
+//   3. the free shared AI (Pollinations), which works anywhere but is slow
+export class AutoLLM extends LLM {
+  constructor(settings, opts) {
+    super(Object.assign({}, settings, {provider: "auto", label: PROVIDERS.auto.label, url: "auto"}), opts);
+    this.opts = opts || {};
+    this.chosen = null;
+    this.candidates = this.opts.candidates || null;  // tests can pass their own list
+  }
+  describe() { return this.chosen ? this.chosen.describe() : "the best free option available"; }
+  async list() {
+    if (this.candidates) return this.candidates;
+    const out = [];
+    if ((await chromeAIStatus(this.opts.global)) === "available") out.push(new ChromeLLM({}, this.opts));
+    if (await webllmDownloaded(this.opts.store)) out.push(new WebLLMClient({}, this.opts));
+    out.push(new LLM(loadSettings(new Store(), "pollinations"), this.opts));
+    this.candidates = out;
+    return out;
+  }
+  async order() {
+    const all = await this.list();
+    return this.chosen ? [this.chosen].concat(all.filter((c) => c !== this.chosen)) : all;
+  }
+  async chat(messages, opts) {
+    let last = null;
+    for (const c of await this.order()) {
+      try { const t = await c.chat(messages, opts); this.chosen = c; return t; } catch (e) {
+        if (!(e instanceof LLMError)) throw e;
+        last = e;
+      }
+    }
+    throw last || new LLMError("No free AI option is working right now. Try again in a minute, or add your own free key in Settings.");
+  }
+  async *stream(messages, opts) {
+    let last = null;
+    for (const c of await this.order()) {
+      let started = false;
+      try {
+        for await (const chunk of c.stream(messages, opts)) { started = true; this.chosen = c; yield chunk; }
+        if (started) return;
+        this.chosen = c;
+        return;
+      } catch (e) {
+        if (started || !(e instanceof LLMError)) throw e;  // can't switch half way through an answer
+        last = e;
+      }
+    }
+    throw last || new LLMError("No free AI option is working right now.");
+  }
+  async check() {
+    const reply = await this.chat([{role: "user", content: "Reply with the word OK."}], {temperature: 0, maxTokens: 20});
+    return "Working: using " + this.describe() + ". It replied: " + (reply.trim().slice(0, 40) || "(empty)");
+  }
+}
+
+// One place that turns settings into the right kind of AI client.
+export function makeLLM(settings, opts) {
+  const kind = (PROVIDERS[settings.provider] || {}).kind;
+  if (kind === "auto") return new AutoLLM(settings, opts);
+  if (kind === "chrome") return new ChromeLLM(settings, opts);
+  if (kind === "webllm") return new WebLLMClient(settings, opts);
+  return new LLM(settings, opts);
 }
 
 // Returns text, "" for nothing, or null for the end of the stream.
