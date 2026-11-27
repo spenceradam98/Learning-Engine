@@ -36,6 +36,13 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("topic", nargs="?")
     q.add_argument("-n", type=int, default=10, help="number of questions (default 10)")
 
+    d = sub.add_parser("due", help="spaced-repetition review of questions due today")
+    d.add_argument("topic", nargs="?")
+    d.add_argument("-n", type=int, default=20)
+    sub.add_parser("backup", help="save all your work to one file in backups/")
+    rs = sub.add_parser("restore", help="restore work from a backup file")
+    rs.add_argument("file", nargs="?")
+
     r = sub.add_parser("review", help="review weak spots")
     r.add_argument("topic", nargs="?")
     r.add_argument("--no-plan", action="store_true", help="skip the AI study plan")
@@ -63,7 +70,8 @@ def main(argv=None) -> None:
         if cmd == "menu":
             cli.menu()
         elif cmd == "web":
-            from engine import web
+            from engine import backup, web
+            backup.auto_backup()
             web.serve(port=args.port, open_browser=not args.no_browser)
         elif cmd == "setup":
             cli.cmd_setup()
@@ -75,6 +83,12 @@ def main(argv=None) -> None:
             cli.cmd_generate(args.topic, args.n, args.level)
         elif cmd == "quiz":
             cli.cmd_quiz(args.topic, args.n)
+        elif cmd == "due":
+            cli.cmd_review_due(args.topic, args.n)
+        elif cmd == "backup":
+            cli.cmd_backup()
+        elif cmd == "restore":
+            cli.cmd_restore(args.file)
         elif cmd == "review":
             cli.cmd_review(args.topic, plan=not args.no_plan)
         elif cmd == "assignment":

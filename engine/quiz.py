@@ -12,7 +12,8 @@ from .question_bank import QuestionBank
 
 class QuizSession:
     def __init__(self, topic_key: str, llm: Optional[LLMClient] = None, length: int = 10,
-                 rng: Optional[random.Random] = None):
+                 rng: Optional[random.Random] = None, mode: str = "adaptive"):
+        """mode "adaptive" is a normal quiz; "review" asks only questions due for review."""
         self.topic_key = topic_key
         self.info = topics.get(topic_key)
         self.llm = llm or LLMClient()
@@ -25,6 +26,11 @@ class QuizSession:
         self.current: Optional[dict] = None
         self.last_wrong: Optional[dict] = None  # (question, chosen) for re-explaining
         self.start_difficulty = self.progress.difficulty
+        self.mode = mode
+        self.due: List[str] = []
+        if mode == "review":
+            self.due = [qid for qid in self.progress.due_ids() if self.bank.by_id(qid)]
+            self.length = min(length, len(self.due))
 
     @property
     def finished(self) -> bool:
@@ -45,6 +51,9 @@ class QuizSession:
         """
         if self.finished:
             return None
+        if self.mode == "review":
+            self.current = self.bank.by_id(self.due.pop(0)) if self.due else None
+            return self.current
         q = self.bank.pick(self.difficulty, self.asked, self.progress.question_stats(),
                            self._mastery(), self.rng)
         if q is None and allow_generate:
@@ -62,7 +71,7 @@ class QuizSession:
         if q is None:
             raise RuntimeError("no current question")
         before = self.difficulty
-        dec = self.progress.record(q, chosen, confidence)
+        dec = self.progress.record(q, chosen, confidence, adapt=self.mode != "review")
         correct = chosen is not None and chosen == q["answer_index"]
         self.asked.append(q["id"])
         result = {

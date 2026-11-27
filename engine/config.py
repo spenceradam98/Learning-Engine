@@ -53,6 +53,9 @@ DEFAULT_PROVIDER = "local"
 LLM_TIMEOUT = int(os.environ.get("LE_LLM_TIMEOUT", "300"))
 # How many extra attempts when the model returns broken JSON.
 LLM_JSON_RETRIES = 2
+# Free online APIs sometimes answer "busy" (HTTP 503) or "slow down" (429).
+# Wait this many seconds before each automatic retry.
+LLM_BUSY_RETRY_DELAYS = (2, 5, 10)
 # Rough character budget for pasted assignment text sent to the model.
 # ~4 chars per token; keeps prompts inside a 4096-token context.
 MAX_CONTEXT_CHARS = int(os.environ.get("LE_MAX_CONTEXT_CHARS", "6000"))

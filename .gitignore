@@ -10,3 +10,4 @@ data/assignments/*.json
 *.tmp
 .DS_Store
 models/
+data/backups/

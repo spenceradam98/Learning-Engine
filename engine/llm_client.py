@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from typing import Any, Callable, Dict, Iterator, List, Optional
 
 import requests
@@ -86,6 +87,21 @@ class LLMClient:
         return payload
 
     def _post(self, payload: dict, stream: bool = False) -> requests.Response:
+        """POST, retrying a few times when a busy service says "try again" (503 or 429)."""
+        delays = list(config.LLM_BUSY_RETRY_DELAYS)
+        while True:
+            r = self._post_once(payload, stream)
+            if r.status_code not in (429, 503) or not delays:
+                return self._check_response(r, payload, stream)
+            wait = delays.pop(0)
+            try:  # the service may say how long to wait; keep it short either way
+                wait = min(30.0, max(wait, float(r.headers.get("Retry-After", 0))))
+            except (TypeError, ValueError):
+                pass
+            r.close()
+            _sleep(wait)
+
+    def _post_once(self, payload: dict, stream: bool) -> requests.Response:
         try:
             r = requests.post(self.url, json=payload, headers=self._headers(),
                               timeout=self.timeout, stream=stream)
@@ -98,6 +114,10 @@ class LLMClient:
                                .format(self.base_url())) from e
             raise LLMError("Can't reach {}. Check your internet connection."
                            .format(self.base_url())) from e
+        return r
+
+    def _check_response(self, r: requests.Response, payload: dict,
+                        stream: bool) -> requests.Response:
         if r.status_code == 400 and "response_format" in payload:
             # Probably an older server that doesn't know json schemas.
             self._schema_supported = False
@@ -109,6 +129,9 @@ class LLMClient:
                            "to enter it again.".format(r.status_code))
         if r.status_code == 429:
             raise LLMError("The free API's rate limit was hit. Wait a minute and try again.")
+        if r.status_code == 503 and not self.is_local:
+            raise LLMError("{} is overloaded right now (HTTP 503). Wait a minute and try again, "
+                           "or pick a different model in AI settings.".format(self.settings["label"]))
         if r.status_code == 404 and not self.is_local:
             raise LLMError("The API doesn't know the model '{}'. Free model names change; "
                            "run `python main.py setup` and pick a current one.".format(self.model))
@@ -166,6 +189,10 @@ class LLMClient:
                      "the JSON object, nothing else.".format(last_error)},
                 ]
         raise LLMError("The model kept returning unusable output ({}).".format(last_error))
+
+
+def _sleep(seconds: float) -> None:
+    time.sleep(seconds)  # a separate function so tests can skip the wait
 
 
 _FENCE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL | re.IGNORECASE)

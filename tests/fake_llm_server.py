@@ -25,10 +25,23 @@ class H(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
+    def end_headers(self):
+        # Like llama-server, allow the browser app on another port to call it.
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+        super().end_headers()
+
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self.end_headers()
+
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b'{"status":"ok"}')
+        if self.path.endswith("/models"):
+            self.wfile.write(b'{"data":[{"id":"fake-small"},{"id":"fake-large"},{"id":"whisper-1"}]}')
+        else:
+            self.wfile.write(b'{"status":"ok"}')
 
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))

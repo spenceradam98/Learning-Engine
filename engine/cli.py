@@ -5,7 +5,7 @@ from typing import Optional
 
 from rich.markup import escape
 
-from . import config, generator, review, topics, ui
+from . import backup, config, generator, models, review, stats, topics, ui
 from .assignments import AssignmentStore
 from .llm_client import LLMClient, LLMError
 from .progress import Progress
@@ -61,13 +61,87 @@ def cmd_setup() -> None:
         api_key = typed.strip() or (current["api_key"] if same else "")
     model = preset["model"]
     if key != "local":
-        model = ui.ask("Model name", default=(current["model"] if same else preset["model"]) or None)
+        model = _pick_model(key, url, api_key, current["model"] if same else preset["model"])
     config.save_settings(key, url, model, api_key)
     ui.ok("Saved to settings.json.")
     if key != "local":
         ui.warn("Note: with an online provider, your questions and pasted assignment text are "
                 "sent to that service.")
     cmd_check()
+
+
+def _pick_model(provider: str, url: str, api_key: str, suggested: str) -> str:
+    """Show the provider's current models to choose from; type one if the list can't load."""
+    preset = config.PROVIDERS[provider]
+    try:
+        with ui.spin("Loading the list of available models"):
+            found = models.list_models({"provider": provider, "url": url, "api_key": api_key,
+                                        "needs_key": preset["needs_key"]})
+    except LLMError as e:
+        ui.warn("{} Type a model name instead.".format(escape(str(e))))
+        return ui.ask("Model name", default=suggested or None)
+    ids = [m["id"] for m in found]
+    pick = models.preferred(found, suggested, preset["model"])
+    # Put the suggested model first so pressing 1 is always a safe choice.
+    if pick in ids:
+        ids.remove(pick)
+        ids.insert(0, pick)
+    shown = ids[:40]
+    labels = [escape(m) + (" [dim](current)[/]" if m == suggested else "") for m in shown]
+    labels.append("Type a model name myself")
+    if len(ids) > len(shown):
+        ui.info("Showing 40 of {} models.".format(len(ids)))
+    i = ui.choose("Which model? (1 is a good default)", labels)
+    if i == len(shown):
+        return ui.ask("Model name", default=suggested or None)
+    return shown[i]
+
+
+def cmd_backup() -> None:
+    path = backup.write_backup()
+    ui.ok("Saved a backup of all your work to {}".format(path))
+    ui.info("You can open this file in the online app too: Settings > Restore from a backup.")
+
+
+def cmd_restore(path: Optional[str]) -> None:
+    if not path:
+        path = ui.ask("Drag the backup file into this window (or type its path), then press Enter")
+    path = path.strip().strip("'\"")
+    try:
+        counts = backup.restore_backup(path)
+    except ValueError as e:
+        ui.error(str(e))
+        return
+    ui.ok("Restored {questions} questions, progress for {topics} topics and {assignments} "
+          "assignments. (Your previous data was saved in data/backups/ first.)".format(**counts))
+
+
+def cmd_review_due(topic: Optional[str], n: int = 20) -> None:
+    rows = stats.due_by_topic()
+    if topic:
+        try:
+            key = topics.resolve(topic)
+        except KeyError:
+            ui.error("Unknown topic '{}'.".format(topic))
+            return
+        rows = [r for r in rows if r["key"] == key]
+    if not rows:
+        ui.ok("Nothing is due for review right now.")
+        return
+    if len(rows) == 1:
+        key = rows[0]["key"]
+    else:
+        i = ui.choose("Which topic?", ["{} ({} due)".format(escape(r["name"]), r["due"]) for r in rows])
+        key = rows[i]["key"]
+    run_quiz(key, n, mode="review")
+
+
+def show_today() -> None:
+    s = stats.summary()
+    bits = ["{}-day streak".format(s["streak"]), "{} answered today".format(s["answered_today"])]
+    if s["due_total"]:
+        bits.append("{} due for review".format(s["due_total"]))
+    ui.info(" · ".join(bits))
 
 
 def cmd_topics() -> None:
@@ -121,12 +195,17 @@ def cmd_quiz(topic: Optional[str], n: int = 10) -> None:
         run_quiz(key, n)
 
 
-def run_quiz(key: str, n: int = 10) -> None:
-    session = QuizSession(key, length=n)
-    ui.title("Quiz: {}".format(session.info.name))
-    ui.info("Starting at level {}/5. 3 right in a row moves you up; 2 wrong moves you down."
-            .format(session.difficulty))
-    if len(session.bank) == 0:
+def run_quiz(key: str, n: int = 10, mode: str = "adaptive") -> None:
+    session = QuizSession(key, length=n, mode=mode)
+    n = session.length
+    if mode == "review":
+        ui.title("Review: {}".format(session.info.name))
+        ui.info("{} questions due. Your level doesn't change in a review.".format(n))
+    else:
+        ui.title("Quiz: {}".format(session.info.name))
+        ui.info("Starting at level {}/5. 3 right in a row moves you up; 2 wrong moves you down."
+                .format(session.difficulty))
+    if len(session.bank) == 0 and mode != "review":
         ui.warn("No questions yet, so I'll make them as we go. Run `generate` first to skip the waits.")
     while not session.finished:
         try:
@@ -362,8 +441,12 @@ def menu() -> None:
     config.ensure_dirs()
     ui.title("Learning Engine")
     ui.info("AI: {}".format(LLMClient().describe()))
+    show_today()
+    if backup.auto_backup():
+        ui.info("Saved today's automatic backup in data/backups/.")
     actions = [
         ("Quiz me", lambda: cmd_quiz(None)),
+        ("Review questions due today (spaced repetition)", lambda: cmd_review_due(None)),
         ("Generate 10 new questions", lambda: cmd_generate(None)),
         ("Review weak spots", lambda: cmd_review(None)),
         ("Assignments: learn", lambda: cmd_assignment_learn(None)),
@@ -373,6 +456,7 @@ def menu() -> None:
         ("Topics and progress", cmd_topics),
         ("Choose AI (local or free online)", cmd_setup),
         ("Check the AI connection", cmd_check),
+        ("Back up all my work to a file", cmd_backup),
         ("Quit", None),
     ]
     while True:

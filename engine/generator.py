@@ -60,7 +60,7 @@ def generate(topic_key: str, n: int = 10, llm: Optional[LLMClient] = None,
             q = generate_one(llm, bank, info, sub, levels[i], source)
         except LLMError as e:
             failed += 1
-            if "reach" in str(e) or "key" in str(e) or "rate limit" in str(e):
+            if any(w in str(e) for w in ("reach", "key", "rate limit", "overloaded", "model '")):
                 raise  # no point continuing if the model is unreachable
             continue
         if q is None:

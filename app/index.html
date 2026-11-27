@@ -1,0 +1,214 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- Only this site's own scripts may run. Network calls go to the AI service you pick. -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' https: http://localhost:* http://127.0.0.1:*; manifest-src 'self'; worker-src 'self'; base-uri 'none'; form-action 'none'; object-src 'none'">
+<meta name="referrer" content="no-referrer">
+<title>Learning Engine</title>
+<meta name="description" content="An adaptive tutor for MIDI, sound principles, live sound and your own assignments.">
+<meta name="theme-color" content="#2563eb">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icons/icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="icons/icon-192.png">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header>
+  <h1>Learning Engine</h1>
+  <nav id="nav">
+    <button data-tab="quiz" class="active">Quiz me</button>
+    <button data-tab="generate">Generate</button>
+    <button data-tab="review">Weak spots</button>
+    <button data-tab="assign">Assignments</button>
+    <button data-tab="settings">Settings</button>
+  </nav>
+  <span id="ai"></span>
+  <button class="btn secondary hidden" id="install-btn">Install app</button>
+</header>
+<main>
+  <div id="banner"></div>
+
+  <!-- QUIZ -->
+  <section id="tab-quiz">
+    <div class="card" id="today-card">
+      <h2>Today</h2>
+      <div class="stats">
+        <div class="stat"><b id="st-streak">0</b>day streak</div>
+        <div class="stat"><b id="st-today">0</b>answered today</div>
+        <div class="stat"><b id="st-due">0</b>due for review</div>
+      </div>
+      <div id="st-due-list"></div>
+    </div>
+    <div class="card" id="quiz-setup">
+      <h2>Quiz me</h2>
+      <p class="muted">3 right in a row moves you up a level. 2 wrong in a row moves you down and re-explains the idea.</p>
+      <div class="row">
+        <div><label for="quiz-topic">Topic</label><select id="quiz-topic"></select></div>
+        <div style="flex:0 1 120px"><label for="quiz-n">Questions</label><input id="quiz-n" type="number" min="1" max="50" value="10"></div>
+      </div>
+      <div class="btns"><button class="btn" id="quiz-start">Start quiz</button></div>
+      <div id="quiz-setup-msg"></div>
+    </div>
+    <div class="card hidden" id="quiz-box">
+      <div class="row" style="align-items:center">
+        <div id="quiz-title" style="font-weight:600"></div>
+        <div style="flex:0 0 auto"><span class="pill" id="quiz-meta"></span></div>
+      </div>
+      <div id="quiz-body"></div>
+      <div class="btns"><button class="btn secondary" id="quiz-stop">Stop quiz</button></div>
+    </div>
+  </section>
+
+  <!-- GENERATE -->
+  <section id="tab-generate" class="hidden">
+    <div class="card">
+      <h2>Generate new questions</h2>
+      <p class="muted">Questions are made one at a time and saved, so later quizzes don't have to wait.</p>
+      <div class="row">
+        <div><label for="gen-topic">Topic</label><select id="gen-topic"></select></div>
+        <div style="flex:0 1 110px"><label for="gen-n">How many</label><input id="gen-n" type="number" min="1" max="20" value="10"></div>
+        <div style="flex:0 1 170px"><label for="gen-level">Level</label>
+          <select id="gen-level"><option value="">Around my level</option><option>1</option><option>2</option><option>3</option><option>4</option><option>5</option></select></div>
+      </div>
+      <div class="btns"><button class="btn" id="gen-go">Generate</button></div>
+      <div id="gen-status" class="hidden"><p id="gen-msg" class="muted"></p><progress id="gen-bar" value="0" max="10"></progress></div>
+      <div id="gen-result"></div>
+    </div>
+    <div class="card"><h2>Question bank</h2><div id="topics-table"></div></div>
+  </section>
+
+  <!-- REVIEW -->
+  <section id="tab-review" class="hidden"><div id="review-body"></div></section>
+
+  <!-- ASSIGNMENTS -->
+  <section id="tab-assign" class="hidden">
+    <div id="assign-list-view">
+      <div class="card">
+        <div class="row" style="align-items:center"><h2 style="margin:0">Your assignments</h2>
+          <div style="flex:0 0 auto"><button class="btn" id="assign-new">Add assignment</button></div></div>
+        <div id="assign-list" style="margin-top:8px"></div>
+      </div>
+      <div class="card hidden" id="assign-form">
+        <h2>Add an assignment</h2>
+        <div class="row">
+          <div><label for="af-title">Title</label><input id="af-title" placeholder="e.g. Live sound report: festival stage"></div>
+          <div><label for="af-course">Course / module (optional)</label><input id="af-course"></div>
+          <div style="flex:0 1 160px"><label for="af-due">Due (optional)</label><input id="af-due" placeholder="e.g. 12 Dec"></div>
+        </div>
+        <label for="af-brief">Assignment brief (paste the whole task)</label><textarea id="af-brief"></textarea>
+        <label for="af-rubric">Marking rubric or criteria (optional)</label><textarea id="af-rubric" style="min-height:90px"></textarea>
+        <div class="btns"><button class="btn" id="af-save">Save</button><button class="btn secondary" id="af-cancel">Cancel</button></div>
+        <div id="af-msg"></div>
+      </div>
+    </div>
+    <div id="assign-detail" class="hidden">
+      <div class="card">
+        <div class="btns" style="margin-top:0"><button class="btn secondary" id="ad-back">← All assignments</button>
+          <button class="btn secondary" id="ad-export">Download my work for this assignment</button></div>
+        <h2 id="ad-title" style="margin-top:12px"></h2>
+        <p class="muted" id="ad-meta"></p>
+        <nav id="ad-nav" style="margin:8px 0 0">
+          <button data-sub="learn" class="active">Learn</button>
+          <button data-sub="write">Writing coach</button>
+          <button data-sub="aquiz">Quiz</button>
+          <button data-sub="brief">Brief</button>
+        </nav>
+      </div>
+      <div class="card" id="ad-learn">
+        <h3 style="margin-top:0">Key concepts for this assignment</h3>
+        <div id="ad-concepts"></div>
+        <div id="ad-lesson" class="hidden">
+          <div id="ad-lesson-out" class="out chat"></div>
+          <div class="row"><div><input id="ad-follow" placeholder="Ask a follow-up question..."></div>
+            <div style="flex:0 0 auto"><button class="btn" id="ad-follow-go">Ask</button></div></div>
+          <p class="muted">Lessons and follow-ups are saved with this assignment.</p>
+        </div>
+      </div>
+      <div class="card hidden" id="ad-write">
+        <p class="note warn">Coaching only: this helps you plan, get unstuck and improve your own writing. It won't write the assignment for you.</p>
+        <h3>My draft <span class="saved-at" id="aw-draft-saved"></span></h3>
+        <textarea id="aw-draft" placeholder="Write or paste your draft here. It saves automatically as you type."></textarea>
+        <div class="btns"><button class="btn" id="aw-feedback">Get feedback on my draft</button>
+          <button class="btn secondary" id="aw-plan">Plan it: structure and guiding questions</button></div>
+        <h3>I'm stuck</h3>
+        <div class="row"><div><input id="aw-stuck" placeholder="Which part, and what have you tried?"></div>
+          <div style="flex:0 0 auto"><button class="btn secondary" id="aw-hint">Get hints</button></div></div>
+        <div id="aw-out" class="out" style="margin-top:16px"></div>
+        <h3>My notes <span class="saved-at" id="aw-notes-saved"></span></h3>
+        <textarea id="aw-notes" style="min-height:90px" placeholder="Anything you want to remember: sources, ideas, questions for your teacher. Saves automatically."></textarea>
+        <h3>Saved</h3><div id="aw-saved" class="muted"></div>
+      </div>
+      <div class="card hidden" id="ad-aquiz">
+        <p>Quiz yourself on the concepts this assignment needs. It uses the same adaptive levels.</p>
+        <div class="btns"><button class="btn" id="aq-go">Start assignment quiz</button>
+          <button class="btn secondary" id="aq-gen">Make 5 questions first</button></div>
+        <div id="aq-msg"></div>
+      </div>
+      <div class="card hidden" id="ad-brief"><div id="ad-brief-text" class="out"></div>
+        <div class="btns"><button class="btn secondary" id="ad-delete">Delete this assignment</button></div></div>
+    </div>
+  </section>
+
+  <!-- SETTINGS -->
+  <section id="tab-settings" class="hidden">
+    <div class="card" id="welcome" hidden>
+      <h2>Welcome! One quick step first</h2>
+      <p>This app uses a free AI service to make questions and explain things. You need your own free key. It takes about a minute:</p>
+      <ol class="steps">
+        <li>Open <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">Google AI Studio</a> and sign in with a Google account.</li>
+        <li>Click <b>Create API key</b>, then <b>Copy</b>.</li>
+        <li>Paste it into <b>API key</b> below and click <b>Save</b>.</li>
+      </ol>
+      <p class="muted">Your key stays in this browser only. It is never sent anywhere except to the AI service you pick.</p>
+    </div>
+    <div class="card">
+      <h2>AI settings</h2>
+      <label for="set-provider">AI service</label><select id="set-provider"></select>
+      <p id="set-keylink" class="muted"></p>
+      <div id="set-url-wrap"><label for="set-url">API address</label><input id="set-url" placeholder="https://.../v1/chat/completions"></div>
+      <div id="set-key-wrap"><label for="set-key">API key</label><input id="set-key" type="password" autocomplete="off" spellcheck="false"></div>
+      <div id="set-model-wrap">
+        <label for="set-model-pick">Model</label>
+        <div class="row" style="align-items:center">
+          <div><select id="set-model-pick"></select></div>
+          <div style="flex:0 0 auto"><button class="btn secondary" id="set-load-models">Refresh list</button></div>
+        </div>
+        <div id="set-model-type-wrap" class="hidden"><label for="set-model">Model name</label><input id="set-model" spellcheck="false"></div>
+        <p id="set-model-msg" class="muted"></p>
+      </div>
+      <div class="btns"><button class="btn" id="set-save">Save</button><button class="btn secondary" id="set-check">Test connection</button>
+        <button class="btn secondary" id="set-forget">Remove my key from this browser</button></div>
+      <div id="set-msg"></div>
+      <p class="muted">Your questions and any assignment text you paste are sent to the AI service you choose. If it says it's busy, the app waits and tries again a few times automatically.</p>
+    </div>
+    <div class="card">
+      <h2>Your work</h2>
+      <p>Everything you do is saved automatically in this browser on this computer: your progress, question banks, assignments, drafts, notes and lessons.</p>
+      <p class="muted">Clearing your browser's history and site data would delete it, and it doesn't move to other computers by itself. Download a backup now and then; you can open it on any computer with <b>Restore from a backup</b>.</p>
+      <div class="btns"><button class="btn" id="bk-download">Download a backup</button>
+        <label class="btn" for="bk-file">Restore from a backup</label>
+        <input type="file" id="bk-file" accept=".json,application/json" class="hidden">
+        <button class="btn secondary hidden" id="bk-legacy">Bring in my saved work from this computer's app folder</button></div>
+      <p id="bk-last" class="muted"></p>
+      <div id="bk-msg"></div>
+      <details><summary class="muted">Delete everything</summary>
+        <p class="muted">Removes all your progress, questions, assignments and your key from this browser.</p>
+        <button class="btn secondary" id="bk-wipe">Delete all my data from this browser</button></details>
+    </div>
+    <div class="card">
+      <h2>Share with classmates and teachers</h2>
+      <p>Send them this link. They just open it in Chrome. Nothing to install, no Terminal.</p>
+      <p><code class="link" id="share-link"></code></p>
+      <div class="btns"><button class="btn secondary" id="share-copy">Copy link</button></div>
+      <p class="muted">Each person adds their own free key and their work stays in their own browser, so nobody sees anyone else's work or uses anyone else's key.</p>
+      <h3>Install it like an app</h3>
+      <p class="muted">In Chrome, click the install icon at the right of the address bar (a screen with a down arrow), or the <b>Install app</b> button at the top of this page. It then opens in its own window from your Dock or Start menu.</p>
+    </div>
+    <p class="muted" id="version"></p>
+  </section>
+</main>
+<script type="module" src="ui.js"></script>
+</body>
+</html>
