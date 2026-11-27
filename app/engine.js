@@ -4,7 +4,7 @@
 // This mirrors the Python engine in ../engine (same data format), so backups
 // move between the two.
 
-export const APP_VERSION = "2.0.0";
+export const APP_VERSION = "2.0.1";
 
 // ---------------------------------------------------------------- settings ---
 
@@ -174,6 +174,35 @@ export class LLMError extends Error {}
 
 const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
 
+export const ONLINE_TIMEOUT_SEC = 45;   // wait this long for an online service to start answering
+export const LOCAL_TIMEOUT_SEC = 300;   // a local model on an old Mac is slow
+export const STREAM_IDLE_SEC = 60;      // give up if a streamed answer goes quiet this long
+
+// Pulls the human-readable message out of an error reply (OpenAI or Google style).
+export function errorMessage(text) {
+  try {
+    let d = JSON.parse(text);
+    if (Array.isArray(d)) d = d[0];
+    const e = d && (d.error || d);
+    const m = e && (e.message || (typeof e === "string" ? e : ""));
+    if (m) return String(m).slice(0, 300);
+  } catch (e) { /* not JSON */ }
+  return String(text || "").replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim().slice(0, 200);
+}
+
+// Gemini 2.5+ "thinks" before answering, which is slow and eats the answer's
+// token budget. Turn it off (Flash) or down (Pro, Gemini 3) for quick replies.
+export function reasoningEffort(provider, model) {
+  if (provider !== "gemini") return null;
+  const m = String(model || "").toLowerCase();
+  if (/2\.5-flash/.test(m)) return "none";
+  if (/gemini-(2\.5|[3-9])/.test(m)) return "low";
+  return null;
+}
+
+class Timeout extends Error {}
+class NetworkFail extends Error {}
+
 export class LLM {
   constructor(settings, opts) {
     opts = opts || {};
@@ -181,7 +210,11 @@ export class LLM {
     this.fetch = opts.fetch || ((...a) => fetch(...a));
     this.sleep = opts.sleep || ((sec) => sleepMs(sec * 1000));
     this.isLocal = settings.provider === "local";
+    this.timeoutSec = opts.timeoutSec || (this.isLocal ? LOCAL_TIMEOUT_SEC : ONLINE_TIMEOUT_SEC);
+    this.idleSec = opts.idleSec || (this.isLocal ? LOCAL_TIMEOUT_SEC : STREAM_IDLE_SEC);
     this.schemaOk = this.isLocal;
+    this.reasoning = reasoningEffort(settings.provider, settings.model);
+    this.onRetry = opts.onRetry || (() => {});  // (try number, of how many); 0 = done
   }
   describe() { return this.isLocal ? "local model" : this.s.label + " · " + this.s.model; }
   headers() {
@@ -192,47 +225,94 @@ export class LLM {
   }
   payload(messages, temperature, maxTokens, stream, schema) {
     const p = {model: this.s.model || "local", messages, temperature, max_tokens: maxTokens, stream: !!stream};
+    if (this.s.provider === "gemini") p.max_tokens = maxTokens + 2048;  // room for any thinking
+    if (this.reasoning) p.reasoning_effort = this.reasoning;
     if (schema && this.schemaOk) p.response_format = {type: "json_object", schema};
     return p;
   }
   async postOnce(payload) {
+    const ctl = typeof AbortController !== "undefined" ? new AbortController() : null;
+    let timedOut = false;
+    const timer = setTimeout(() => { timedOut = true; if (ctl) ctl.abort(); }, this.timeoutSec * 1000);
     try {
-      return await this.fetch(this.s.url, {method: "POST", headers: this.headers(), body: JSON.stringify(payload)});
+      return await this.fetch(this.s.url, {method: "POST", headers: this.headers(), body: JSON.stringify(payload),
+        signal: ctl ? ctl.signal : undefined});
     } catch (e) {
-      if (this.isLocal) throw new LLMError("Can't reach the local model. Is llama-server running?");
-      throw new LLMError("Can't reach " + this.s.label + ". Check your internet connection.");
+      if (timedOut) throw new Timeout();
+      throw new NetworkFail(e && e.message);
+    } finally {
+      clearTimeout(timer);
     }
+  }
+  offlineOr(msg) {
+    if (typeof navigator !== "undefined" && navigator.onLine === false)
+      return new LLMError("This computer seems to be offline. Check your internet connection and try again.");
+    return new LLMError(msg);
   }
   async post(payload) {
     if (!this.s.url) throw new LLMError("No AI chosen yet. Open Settings and pick one.");
     if (this.s.needsKey && !this.s.apiKey) throw new LLMError("No API key yet. Open Settings and paste your free key.");
     const delays = BUSY_RETRY_DELAYS.slice();
+    const name = this.s.label + " (" + this.s.model + ")";
     for (;;) {
-      const r = await this.postOnce(payload);
-      if ((r.status === 503 || r.status === 429) && delays.length) {
+      let r;
+      try {
+        r = await this.postOnce(payload);
+      } catch (e) {
+        if (this.isLocal) {
+          if (e instanceof Timeout) throw new LLMError("The local model took longer than " + this.timeoutSec + " seconds. Try again or use a smaller model.");
+          throw new LLMError("Can't reach the local model. Is llama-server running?");
+        }
+        // A busy or rate-limited service sometimes answers in a way the browser
+        // can only see as a dropped connection, so treat it like "busy": retry.
+        if (delays.length) {
+          this.onRetry(BUSY_RETRY_DELAYS.length - delays.length + 1, BUSY_RETRY_DELAYS.length);
+          await this.sleep(delays.shift());
+          continue;
+        }
+        this.onRetry(0);
+        if (e instanceof Timeout)
+          throw this.offlineOr(name + " didn't answer within " + this.timeoutSec + " seconds, even after a few tries. " +
+            "It's probably overloaded. Wait a minute and try again, or pick a lighter model (such as gemini-2.5-flash-lite) or another service in Settings.");
+        throw this.offlineOr("Couldn't get an answer from " + name + ", even after a few tries. Usually this means the free service is " +
+          "overloaded or your free daily limit is used up. Wait a minute and try again, or pick another model or service in Settings.");
+      }
+      if ([429, 500, 502, 503, 504].includes(r.status) && delays.length) {
         let wait = delays.shift();
         const ra = parseFloat((r.headers && r.headers.get && r.headers.get("Retry-After")) || "0");
         if (ra > wait) wait = Math.min(30, ra);
+        this.onRetry(BUSY_RETRY_DELAYS.length - delays.length, BUSY_RETRY_DELAYS.length);
         await this.sleep(wait);
         continue;
       }
+      this.onRetry(0);
+      if (r.ok) return r;
+      const text = await r.text().catch(() => "");
+      const msg = errorMessage(text);
+      const low = msg.toLowerCase();
       if (r.status === 400 && payload.response_format) {
         this.schemaOk = false;
         payload = Object.assign({}, payload);
         delete payload.response_format;
         continue;
       }
-      if (r.ok) return r;
-      const text = await r.text().catch(() => "");
-      if (r.status === 401 || r.status === 403)
-        throw new LLMError("The AI service rejected your key (HTTP " + r.status + "). Check it in Settings.");
+      if (r.status === 400 && payload.reasoning_effort && /reason|think/.test(low)) {
+        this.reasoning = null;  // this model can't change its thinking: ask without it
+        payload = Object.assign({}, payload);
+        delete payload.reasoning_effort;
+        continue;
+      }
+      if (r.status === 401 || r.status === 403 || (r.status === 400 && /api.?key/.test(low)))
+        throw new LLMError("The AI service rejected your key. Copy it again from the provider's website, paste it in Settings and click Save." +
+          (msg ? " (It said: " + msg + ")" : ""));
       if (r.status === 429)
-        throw new LLMError("The free API's rate limit was hit. Wait a minute and try again.");
-      if (r.status === 503)
-        throw new LLMError(this.s.label + " is overloaded right now. Wait a minute and try again, or pick a different model in Settings.");
+        throw new LLMError("You've hit the free usage limit for " + name + ". Wait a minute (or until tomorrow for a daily limit), or pick another model in Settings." +
+          (msg ? " (It said: " + msg + ")" : ""));
+      if (r.status >= 500)
+        throw new LLMError(name + " is overloaded right now. Wait a minute and try again, or pick a different model in Settings.");
       if (r.status === 404)
-        throw new LLMError("The AI service doesn't know the model '" + this.s.model + "'. Pick another one in Settings.");
-      throw new LLMError("AI service error HTTP " + r.status + ": " + text.slice(0, 200));
+        throw new LLMError("The AI service doesn't know the model '" + this.s.model + "'. Pick another one in Settings." + (msg ? " (It said: " + msg + ")" : ""));
+      throw new LLMError("The AI service said: " + (msg || "error HTTP " + r.status) + " (HTTP " + r.status + ")");
     }
   }
   async chat(messages, opts) {
@@ -255,9 +335,20 @@ export class LLM {
     const reader = r.body.getReader(), dec = new TextDecoder();
     let buf = "";
     for (;;) {
-      const {done, value} = await reader.read();
-      if (done) break;
-      buf += dec.decode(value, {stream: true});
+      let timer;
+      const idle = new Promise((_, reject) => { timer = setTimeout(() => reject(new Timeout()), this.idleSec * 1000); });
+      let res;
+      try {
+        res = await Promise.race([reader.read(), idle]);
+      } catch (e) {
+        reader.cancel().catch(() => {});
+        if (e instanceof Timeout) throw new LLMError("The AI stopped answering part way through. Try again.");
+        throw new LLMError("The connection dropped part way through the answer. Try again.");
+      } finally {
+        clearTimeout(timer);
+      }
+      if (res.done) break;
+      buf += dec.decode(res.value, {stream: true});
       let nl;
       while ((nl = buf.indexOf("\n")) >= 0) {
         const line = buf.slice(0, nl); buf = buf.slice(nl + 1);
@@ -286,8 +377,8 @@ export class LLM {
     throw new LLMError("The AI kept returning unusable output (" + lastError + ").");
   }
   async check() {
-    const reply = await this.chat([{role: "user", content: "Reply with the word OK."}], {temperature: 0, maxTokens: 5});
-    return "Connected to " + this.describe() + ". It replied: " + reply.trim().slice(0, 40);
+    const reply = await this.chat([{role: "user", content: "Reply with the word OK."}], {temperature: 0, maxTokens: 20});
+    return "Connected to " + this.describe() + ". It replied: " + (reply.trim().slice(0, 40) || "(an empty reply, but the connection works)");
   }
 }
 
@@ -350,7 +441,7 @@ function firstBalanced(text) {
 // ----------------------------------------------------------- model picker ---
 
 const NOT_CHAT = ["whisper", "tts", "embed", "imagen", "veo", "aqa", "guard", "orpheus",
-  "moderation", "dall-e", "image-generation", "native-audio", "learnlm"];
+  "moderation", "dall-e", "image", "native-audio", "audio", "live", "learnlm", "computer-use", "robotics", "lyria"];
 
 export function modelsUrl(chatUrl) {
   let u = (chatUrl || "").trim().replace(/\/+$/, "");
@@ -375,6 +466,8 @@ export function parseModels(data, provider) {
     if (id.startsWith("models/")) id = id.slice(7);
     const low = id.toLowerCase();
     if (!id || seen.has(id) || NOT_CHAT.some((w) => low.includes(w))) continue;
+    // Gemma models on Gemini's API reject the instructions this app sends.
+    if (provider === "gemini" && low.startsWith("gemma")) continue;
     seen.add(id);
     out.push({id, free: isFree(it)});
   }
@@ -395,11 +488,17 @@ export async function listModels(settings, fetchFn) {
   const headers = {};
   if (settings.apiKey) headers.Authorization = "Bearer " + settings.apiKey;
   let r;
-  try { r = await fetchFn(modelsUrl(settings.url), {headers}); } catch (e) {
-    throw new LLMError("Couldn't load the model list. Check your internet connection, or type a model name.");
+  const ctl = typeof AbortController !== "undefined" ? new AbortController() : null;
+  const timer = setTimeout(() => ctl && ctl.abort(), 15000);
+  try { r = await fetchFn(modelsUrl(settings.url), {headers, signal: ctl ? ctl.signal : undefined}); } catch (e) {
+    throw new LLMError("Couldn't load the model list (no answer from the service). The suggested model usually works.");
+  } finally { clearTimeout(timer); }
+  if (!r.ok) {
+    const msg = errorMessage(await r.text().catch(() => ""));
+    if (r.status === 401 || r.status === 403 || (r.status === 400 && /api.?key/i.test(msg)))
+      throw new LLMError("The key was rejected. Copy it again from the provider's website and paste it here." + (msg ? " (It said: " + msg + ")" : ""));
+    throw new LLMError("Couldn't load the model list (HTTP " + r.status + (msg ? ": " + msg : "") + ").");
   }
-  if (r.status === 401 || r.status === 403) throw new LLMError("The key was rejected (HTTP " + r.status + "). Check it and try again.");
-  if (!r.ok) throw new LLMError("Couldn't load the model list (HTTP " + r.status + "). You can type a model name instead.");
   let data;
   try { data = await r.json(); } catch (e) { throw new LLMError("The provider's model list was in an unexpected format."); }
   const models = parseModels(data, settings.provider);

@@ -1,6 +1,6 @@
 // Lets the app open quickly and work offline (except the AI, which needs the internet).
 // Only this app's own files are cached. Calls to AI services always go to the network.
-const VERSION = "le-2.0.0";
+const VERSION = "le-2.0.1";
 const FILES = ["./", "index.html", "styles.css", "ui.js", "engine.js", "manifest.webmanifest",
   "icons/icon.svg", "icons/icon-192.png", "icons/icon-512.png", "icons/maskable-512.png"];
 

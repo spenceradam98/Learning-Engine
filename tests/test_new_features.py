@@ -169,3 +169,43 @@ class WebTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ConnectionProblemTests(unittest.TestCase):
+    def gemini(self, model="gemini-2.5-flash"):
+        return llm_client.LLMClient({"provider": "gemini", "label": "Google Gemini", "model": model,
+                                     "url": "https://x/v1/chat/completions", "api_key": "k", "needs_key": True})
+
+    def test_dropped_connection_is_retried(self):
+        import requests
+        replies = [requests.ConnectionError("reset"), FakeResp(200, {"choices": [{"message": {"content": "OK"}}]})]
+
+        def post(*a, **k):
+            r = replies.pop(0)
+            if isinstance(r, Exception):
+                raise r
+            return r
+        with mock.patch("requests.post", side_effect=post), mock.patch.object(llm_client, "_sleep"):
+            self.assertEqual(self.gemini().chat([{"role": "user", "content": "hi"}]), "OK")
+
+    def test_bad_key_400_and_thinking_settings(self):
+        body = [{"error": {"code": 400, "message": "API key not valid. Please pass a valid API key."}}]
+        with mock.patch("requests.post", return_value=FakeResp(400, body)) as post:
+            with self.assertRaisesRegex(llm_client.LLMError, "rejected your key.*API key not valid"):
+                self.gemini().chat([{"role": "user", "content": "hi"}], max_tokens=100)
+        sent = post.call_args[1]["json"]
+        self.assertEqual((sent["reasoning_effort"], sent["max_tokens"]), ("none", 2148))
+        self.assertEqual(self.gemini().timeout, config.LLM_ONLINE_TIMEOUT)
+
+    def test_unsupported_thinking_setting_is_dropped(self):
+        replies = [FakeResp(400, {"error": {"message": "reasoning_effort not supported"}}),
+                   FakeResp(200, {"choices": [{"message": {"content": "OK"}}]})]
+        sent = []
+
+        def post(*a, **k):
+            sent.append(dict(k["json"]))
+            return replies.pop(0)
+        with mock.patch("requests.post", side_effect=post):
+            self.assertEqual(self.gemini("gemini-2.5-pro").chat([{"role": "user", "content": "hi"}]), "OK")
+        self.assertEqual(sent[0]["reasoning_effort"], "low")
+        self.assertNotIn("reasoning_effort", sent[1])

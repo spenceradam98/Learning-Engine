@@ -6,7 +6,14 @@ const LETTERS = "ABCD";
 const store = new E.Store(window.localStorage);
 let SETTINGS = E.loadSettings(store), QUIZ = null, ASSIGN = null, LESSON = null, MODELS = null;
 const assignments = new E.Assignments(store);
-const llm = () => new E.LLM(SETTINGS);
+// Shows "busy, trying again" while the AI client retries, so nothing looks frozen.
+function onRetry(n, total) {
+  const b = $("busy-note");
+  if (!n) { b.classList.add("hidden"); return; }
+  b.textContent = SETTINGS.label + " is busy or slow to answer. Trying again (" + n + " of " + total + ")...";
+  b.classList.remove("hidden");
+}
+const llm = () => new E.LLM(SETTINGS, {onRetry});
 
 // ---------------------------------------------------------------- helpers ---
 function esc(s) {
@@ -554,7 +561,7 @@ $("set-save").onclick = () => {
 };
 $("set-check").onclick = async () => {
   thinking($("set-msg"));
-  try { note($("set-msg"), "good", await new E.LLM(currentForm()).check()); } catch (e) { note($("set-msg"), "bad", e.message); }
+  try { note($("set-msg"), "good", await new E.LLM(currentForm(), {onRetry}).check()); } catch (e) { note($("set-msg"), "bad", e.message); }
 };
 $("set-forget").onclick = () => {
   if (!confirm("Remove your API key from this browser? Your work stays.")) return;

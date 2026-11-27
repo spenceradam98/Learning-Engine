@@ -155,3 +155,75 @@ test("assignment export includes draft, notes and feedback", () => {
   const md = E.assignmentMarkdown({title: "T", brief_text: "B", working_draft: "D", notes: "N", drafts: [{ts: "2026-01-01T10:00:00", feedback: "F"}], lessons: {}});
   for (const part of ["# T", "## My notes", "N", "## My current draft", "D", "F"]) assert.ok(md.includes(part), part);
 });
+
+// ---- connection problems (the "stuck thinking" bug) ----
+const gemini = (over = {}) => settings(Object.assign({provider: "gemini", label: "Google Gemini", model: "gemini-2.5-flash"}, over));
+
+test("a dropped connection is retried like a busy service, then explained", async () => {
+  let calls = 0;
+  const waits = [];
+  const llm = new E.LLM(gemini(), {fetch: async () => { calls++; throw new TypeError("Failed to fetch"); }, sleep: async (s) => waits.push(s)});
+  await assert.rejects(llm.chat([{role: "user", content: "hi"}]), /overloaded or your free daily limit/);
+  assert.equal(calls, 4);
+  assert.deepEqual(waits, [2, 5, 10]);
+});
+
+test("recovers when a retry after a dropped connection works", async () => {
+  const replies = [() => { throw new TypeError("Failed to fetch"); }, () => fakeResponse(200, {choices: [{message: {content: "OK"}}]})];
+  const llm = new E.LLM(gemini(), {fetch: async () => replies.shift()(), sleep: async () => {}});
+  assert.equal(await llm.chat([{role: "user", content: "hi"}]), "OK");
+});
+
+test("gives up on a request that never answers instead of hanging", async () => {
+  const hang = (url, opts) => new Promise((_, reject) => opts.signal.addEventListener("abort", () => reject(new Error("aborted"))));
+  const llm = new E.LLM(gemini(), {fetch: hang, sleep: async () => {}, timeoutSec: 0.05});
+  const t0 = Date.now();
+  await assert.rejects(llm.chat([{role: "user", content: "hi"}]), /didn't answer within/);
+  assert.ok(Date.now() - t0 < 2000);
+});
+
+test("Gemini's bad-key reply (HTTP 400) says so clearly", async () => {
+  const body = [{error: {code: 400, message: "API key not valid. Please pass a valid API key.", status: "INVALID_ARGUMENT"}}];
+  const llm = new E.LLM(gemini(), {fetch: async () => fakeResponse(400, body), sleep: async () => {}});
+  await assert.rejects(llm.chat([{role: "user", content: "hi"}]), /rejected your key.*API key not valid/);
+});
+
+test("quota errors show Google's own message", async () => {
+  const body = {error: {message: "You exceeded your current quota"}};
+  const llm = new E.LLM(gemini(), {fetch: async () => fakeResponse(429, body), sleep: async () => {}});
+  await assert.rejects(llm.chat([{role: "user", content: "hi"}]), /free usage limit.*exceeded your current quota/);
+});
+
+test("Gemini thinking is turned down, and dropped if a model refuses it", async () => {
+  assert.equal(E.reasoningEffort("gemini", "gemini-2.5-flash"), "none");
+  assert.equal(E.reasoningEffort("gemini", "gemini-2.5-flash-lite"), "none");
+  assert.equal(E.reasoningEffort("gemini", "gemini-2.5-pro"), "low");
+  assert.equal(E.reasoningEffort("gemini", "gemini-2.0-flash"), null);
+  assert.equal(E.reasoningEffort("groq", "gemini-2.5-flash"), null);
+  const sent = [];
+  const replies = [fakeResponse(400, {error: {message: "reasoning_effort is not supported for this model"}}),
+    fakeResponse(200, {choices: [{message: {content: "OK"}}]})];
+  const llm = new E.LLM(gemini({model: "gemini-2.5-pro"}), {fetch: async (u, o) => { sent.push(JSON.parse(o.body)); return replies.shift(); }});
+  assert.equal(await llm.chat([{role: "user", content: "hi"}], {maxTokens: 100}), "OK");
+  assert.equal(sent[0].reasoning_effort, "low");
+  assert.equal(sent[0].max_tokens, 2148);
+  assert.equal(sent[1].reasoning_effort, undefined);
+});
+
+test("errorMessage handles both error shapes and plain text", () => {
+  assert.equal(E.errorMessage('[{"error":{"message":"boom"}}]'), "boom");
+  assert.equal(E.errorMessage('{"error":{"message":"bang"}}'), "bang");
+  assert.equal(E.errorMessage("<html><b>Bad</b> gateway</html>"), "Bad gateway");
+});
+
+test("Gemini model list drops image, audio, live and Gemma models", () => {
+  const out = E.parseModels({data: ["models/gemini-2.5-flash", "models/gemini-2.5-flash-image", "models/gemini-2.5-flash-native-audio-dialog",
+    "models/gemini-live-2.5-flash", "models/gemma-3-27b-it"].map((id) => ({id}))}, "gemini");
+  assert.deepEqual(out.map((m) => m.id), ["gemini-2.5-flash"]);
+});
+
+test("a stream that goes quiet stops with a message", async () => {
+  const body = {getReader: () => ({read: () => new Promise(() => {}), cancel: async () => {}})};
+  const llm = new E.LLM(gemini(), {fetch: async () => ({status: 200, ok: true, headers: {get: () => null}, body}), idleSec: 0.05});
+  await assert.rejects((async () => { for await (const c of llm.stream([{role: "user", content: "hi"}])) void c; })(), /stopped answering/);
+});

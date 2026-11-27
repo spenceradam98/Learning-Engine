@@ -51,6 +51,8 @@ DEFAULT_PROVIDER = "local"
 
 # A 7B model on a 2014 Intel CPU is slow. Give it plenty of time.
 LLM_TIMEOUT = int(os.environ.get("LE_LLM_TIMEOUT", "300"))
+# Online services answer in seconds; if one stalls, give up and retry sooner.
+LLM_ONLINE_TIMEOUT = int(os.environ.get("LE_LLM_ONLINE_TIMEOUT", "60"))
 # How many extra attempts when the model returns broken JSON.
 LLM_JSON_RETRIES = 2
 # Free online APIs sometimes answer "busy" (HTTP 503) or "slow down" (429).

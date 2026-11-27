@@ -17,14 +17,42 @@ class LLMError(Exception):
     """Raised when the local model can't be reached or keeps returning junk."""
 
 
+def error_message(text: str) -> str:
+    """The human-readable part of an error reply (OpenAI or Google style)."""
+    try:
+        d = json.loads(text)
+        if isinstance(d, list) and d:
+            d = d[0]
+        e = d.get("error", d) if isinstance(d, dict) else d
+        m = e.get("message") if isinstance(e, dict) else e
+        if m:
+            return str(m)[:300]
+    except (ValueError, AttributeError, TypeError):
+        pass
+    return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", text or "")).strip()[:200]
+
+
+def reasoning_effort(provider: str, model: str) -> Optional[str]:
+    """Gemini 2.5+ "thinks" first, which is slow: turn it off (Flash) or down (Pro, Gemini 3)."""
+    if provider != "gemini":
+        return None
+    m = (model or "").lower()
+    if re.search(r"2\.5-flash", m):
+        return "none"
+    if re.search(r"gemini-(2\.5|[3-9])", m):
+        return "low"
+    return None
+
+
 class LLMClient:
-    def __init__(self, settings: Optional[dict] = None, timeout: int = config.LLM_TIMEOUT):
+    def __init__(self, settings: Optional[dict] = None, timeout: Optional[int] = None):
         self.settings = settings or config.load_settings()
         self.url = self.settings["url"]
         self.model = self.settings["model"] or "local"
         self.api_key = self.settings.get("api_key", "")
         self.is_local = self.settings["provider"] == "local"
-        self.timeout = timeout
+        self.timeout = timeout or (config.LLM_TIMEOUT if self.is_local else config.LLM_ONLINE_TIMEOUT)
+        self._reasoning = reasoning_effort(self.settings["provider"], self.model)
         # llama-server accepts a JSON schema and turns it into a grammar, so a
         # small model can't produce broken JSON. Online providers vary, so we
         # only send it locally. If an older llama-server rejects it once, we
@@ -55,7 +83,7 @@ class LLMClient:
                 raise LLMError("No API key set for {}. Run `python main.py setup`."
                                .format(self.settings["label"]))
             reply = self.chat([{"role": "user", "content": "Reply with the word OK."}],
-                              temperature=0, max_tokens=5)
+                              temperature=0, max_tokens=20)
             return "Connected to {}. It replied: {}".format(self.describe(), reply.strip()[:40])
         try:
             r = requests.get(self.base_url() + "/health", timeout=5)
@@ -84,14 +112,25 @@ class LLMClient:
             # llama-server turns this schema into a grammar, so the model
             # literally can't emit anything except matching JSON.
             payload["response_format"] = {"type": "json_object", "schema": schema}
+        if self.settings["provider"] == "gemini":
+            payload["max_tokens"] = max_tokens + 2048  # room for any thinking
+        if self._reasoning:
+            payload["reasoning_effort"] = self._reasoning
         return payload
 
     def _post(self, payload: dict, stream: bool = False) -> requests.Response:
         """POST, retrying a few times when a busy service says "try again" (503 or 429)."""
         delays = list(config.LLM_BUSY_RETRY_DELAYS)
         while True:
-            r = self._post_once(payload, stream)
-            if r.status_code not in (429, 503) or not delays:
+            try:
+                r = self._post_once(payload, stream)
+            except LLMError:
+                # Busy online services sometimes just stall or drop the connection.
+                if self.is_local or not delays:
+                    raise
+                _sleep(delays.pop(0))
+                continue
+            if r.status_code not in (429, 500, 502, 503, 504) or not delays:
                 return self._check_response(r, payload, stream)
             wait = delays.pop(0)
             try:  # the service may say how long to wait; keep it short either way
@@ -106,14 +145,18 @@ class LLMClient:
             r = requests.post(self.url, json=payload, headers=self._headers(),
                               timeout=self.timeout, stream=stream)
         except requests.Timeout as e:
+            if not self.is_local:
+                raise LLMError("{} didn't answer within {}s, even after a few tries. It's probably "
+                               "overloaded: wait a minute, or pick a lighter model with `python main.py "
+                               "setup`.".format(self.describe(), self.timeout)) from e
             raise LLMError("The model took longer than {}s. Try again, or use a smaller "
                            "model (see README).".format(self.timeout)) from e
         except requests.RequestException as e:
             if self.is_local:
                 raise LLMError("Can't reach the model at {}. Is llama-server running?"
                                .format(self.base_url())) from e
-            raise LLMError("Can't reach {}. Check your internet connection."
-                           .format(self.base_url())) from e
+            raise LLMError("Can't reach {}, even after a few tries. Check your internet connection; "
+                           "if it's fine, the service may be overloaded.".format(self.base_url())) from e
         return r
 
     def _check_response(self, r: requests.Response, payload: dict,
@@ -124,19 +167,27 @@ class LLMClient:
             payload = dict(payload)
             payload.pop("response_format", None)
             return self._post(payload, stream)
-        if r.status_code in (401, 403):
-            raise LLMError("The API rejected your key (HTTP {}). Run `python main.py setup` "
-                           "to enter it again.".format(r.status_code))
+        msg = error_message(r.text) if r.status_code != 200 else ""
+        said = " (It said: {})".format(msg) if msg else ""
+        if r.status_code == 400 and "reasoning_effort" in payload and re.search(r"reason|think", msg.lower()):
+            self._reasoning = None  # this model can't change its thinking: ask without it
+            payload = dict(payload)
+            payload.pop("reasoning_effort", None)
+            return self._post(payload, stream)
+        if r.status_code in (401, 403) or (r.status_code == 400 and re.search(r"api.?key", msg.lower())):
+            raise LLMError("The API rejected your key. Run `python main.py setup` to enter it "
+                           "again.{}".format(said))
         if r.status_code == 429:
-            raise LLMError("The free API's rate limit was hit. Wait a minute and try again.")
-        if r.status_code == 503 and not self.is_local:
-            raise LLMError("{} is overloaded right now (HTTP 503). Wait a minute and try again, "
+            raise LLMError("You've hit the free usage limit. Wait a minute (or until tomorrow for a "
+                           "daily limit), or pick another model.{}".format(said))
+        if r.status_code >= 500 and not self.is_local:
+            raise LLMError("{} is overloaded right now. Wait a minute and try again, "
                            "or pick a different model in AI settings.".format(self.settings["label"]))
         if r.status_code == 404 and not self.is_local:
             raise LLMError("The API doesn't know the model '{}'. Free model names change; "
                            "run `python main.py setup` and pick a current one.".format(self.model))
         if r.status_code != 200:
-            raise LLMError("Model server error HTTP {}: {}".format(r.status_code, r.text[:200]))
+            raise LLMError("The AI service said: {} (HTTP {})".format(msg or "error", r.status_code))
         return r
 
     def chat(self, messages: List[Message], temperature: float = 0.7,
