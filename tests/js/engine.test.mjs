@@ -121,7 +121,9 @@ test("backup round-trips and never includes the key", () => {
   assert.ok(!file.includes("secret-key"));
   const b = new E.Store();
   const counts = E.importBackup(b, JSON.parse(file));
-  assert.deepEqual(counts, {topics: 1, questions: 1, assignments: 1});
+  assert.equal(counts.topics, 1); assert.equal(counts.questions, 1); assert.equal(counts.assignments, 1);
+  assert.ok(counts.modules >= 1);
+  assert.equal(new E.Assignments(b).get("live-report").module, "general");
   assert.equal(new E.Assignments(b).get("live-report").working_draft, "my draft");
   assert.equal(new E.Progress(b, "sound").totals().answered, 1);
   assert.throws(() => E.importBackup(b, {hello: 1}), /isn't a Learning Engine backup/);
@@ -325,4 +327,114 @@ test("quizzes work end to end on Automatic with JSON questions", async () => {
 test("private AI says clearly when the computer can't run it", async () => {
   const c = new E.WebLLMClient({}, {importer: async () => { throw new Error("no"); }});
   await assert.rejects(c.chat([{role: "user", content: "hi"}]), /can't run the private AI|WebGPU/);
+});
+
+// ------------------------------------------------------------- modules ---
+
+test("first run creates the built-in and starter modules and keeps old work", () => {
+  const st = new E.Store();
+  new E.Progress(st, "midi").record(q("a"), 0, 2);
+  st.set("questions:old-topic", [q("z")]);
+  const mods = new E.Modules(st);
+  for (const k of ["midi", "sound", "live", "music-business", "creative-labs", "composition", "old-topic"]) assert.ok(mods.has(k), k);
+  assert.match(mods.get("live").name, /Live sound practices/);
+  assert.equal(new E.Progress(st, "midi").totals().answered, 1);
+});
+
+test("modules can be added, renamed, edited and deleted", () => {
+  const st = new E.Store(), mods = new E.Modules(st);
+  const m = mods.add({name: "Studio Recording", description: "Tracking bands", notes: "Week 1: mics", subtopics: "- mic choice\n- tracking\n- overdubs"});
+  assert.equal(m.key, "studio-recording");
+  assert.deepEqual(m.subtopics, ["mic choice", "tracking", "overdubs"]);
+  assert.throws(() => mods.add({name: "studio recording"}), /already have/);
+  assert.throws(() => mods.add({name: "  "}), /name/);
+  mods.update(m.key, {name: "Studio recording practice", my_notes: "remember the DI"});
+  assert.equal(mods.get(m.key).name, "Studio recording practice");
+  assert.equal(mods.get(m.key).my_notes, "remember the DI");
+  assert.equal(mods.add({name: "Assignment helper"}).key, "m-assignment-helper");
+  new E.QuestionBank(st, m.key).questions = [];
+  mods.remove(m.key);
+  assert.ok(!mods.has(m.key));
+});
+
+test("each assignment lives in exactly one module folder", () => {
+  const st = new E.Store(), mods = new E.Modules(st), asg = new E.Assignments(st);
+  const comp = asg.add({title: "Film cue", brief: "Write a 1 minute cue.", module: "composition"});
+  const biz = asg.add({title: "Release plan", brief: "Plan a single release.", module: "music-business"});
+  const loose = asg.add({title: "Essay", brief: "Write an essay.", module: "no-such-module"});
+  assert.equal(comp.module, "composition");
+  assert.equal(loose.module, "general");
+  assert.deepEqual(asg.list("composition").map((a) => a.id), ["film-cue"]);
+  assert.deepEqual(asg.list("music-business").map((a) => a.id), ["release-plan"]);
+  asg.move("film-cue", "music-business");
+  assert.deepEqual(asg.list("music-business").map((a) => a.id), ["film-cue", "release-plan"]);
+  assert.deepEqual(asg.list("composition"), []);
+  assert.throws(() => asg.move("film-cue", "nope"), /no longer exists/);
+  // Deleting a module never deletes its assignments; they move to General.
+  assert.equal(mods.remove("music-business"), 2);
+  assert.deepEqual(asg.list("general").map((a) => a.id).sort(), ["essay", "film-cue", "release-plan"]);
+  // Even deleting General while it holds work keeps the work.
+  mods.remove("general");
+  assert.ok(mods.has("general"));
+  assert.equal(asg.list("general").length, 3);
+});
+
+test("assignments saved before modules existed go into General", () => {
+  const st = new E.Store();
+  st.set("assignments", {old: {id: "old", title: "Old one", brief_text: "brief"}});
+  const a = new E.Assignments(st).get("old");
+  assert.equal(a.module, "general");
+  assert.ok(new E.Modules(st).has("general"));
+});
+
+test("a module's notes guide its questions", () => {
+  const st = new E.Store();
+  const m = new E.Modules(st).add({name: "Live sound lab", description: "Gigs", notes: "We use a Yamaha CL5 desk.", subtopics: ["desk"]});
+  const info = E.topicInfo(st, m.key);
+  assert.equal(info.contextKind, "notes");
+  assert.match(info.context, /CL5/);
+  const msg = E.prompts.question(info.name, "desk", 2, [], info.context, info.contextKind)[1].content;
+  assert.match(msg, /notes about the student's course/);
+  assert.match(msg, /CL5/);
+  assert.ok(E.allTopicKeys(st).includes(m.key));
+});
+
+test("suggested subtopics are cleaned and checked", () => {
+  assert.deepEqual(E.validateSubtopics({subtopics: ["1. Melody", "Harmony", "Harmony", "- Form"]}), ["Melody", "Harmony", "Form"]);
+  assert.throws(() => E.validateSubtopics({subtopics: ["one", "two"]}));
+  assert.throws(() => E.validateSubtopics({nope: 1}));
+});
+
+test("modules and their folders survive a backup", () => {
+  const a = new E.Store();
+  const m = new E.Modules(a).add({name: "Sync licensing", notes: "brief notes", subtopics: ["fees"]});
+  new E.Assignments(a).add({title: "Pitch", brief: "Pitch a track.", module: m.key});
+  const b = new E.Store();
+  E.importBackup(b, JSON.parse(JSON.stringify(E.exportBackup(a))));
+  assert.equal(new E.Modules(b).get(m.key).notes, "brief notes");
+  assert.equal(new E.Assignments(b).get("pitch").module, m.key);
+  // A backup from the terminal version names folders the browser hasn't seen yet.
+  const c = new E.Store();
+  E.importBackup(c, {app: "learning-engine", questions: {}, progress: {},
+    assignments: {gig: {id: "gig", title: "Gig review", brief_text: "Review a gig.", module: "live-events"}}});
+  assert.ok(new E.Modules(c).has("live-events"));
+  assert.equal(new E.Assignments(c).get("gig").module, "live-events");
+});
+
+test("folder download has one folder per module with only its own assignments", () => {
+  const st = new E.Store(), asg = new E.Assignments(st);
+  asg.add({title: "Film cue", brief: "Write a cue.", module: "composition"});
+  asg.add({title: "Release plan", brief: "Plan it.", module: "music-business"});
+  const files = E.moduleFiles(st);
+  const paths = files.map((f) => f.path);
+  assert.ok(paths.includes("Music composition/Assignments/Film cue.txt"));
+  assert.ok(paths.includes("Music business and marketing/Assignments/Release plan.txt"));
+  assert.ok(!paths.some((p) => p.startsWith("Music composition/") && p.includes("Release plan")));
+  assert.deepEqual(E.moduleFiles(st, "composition").map((f) => f.path), ["Music composition/About this module.txt", "Music composition/Assignments/Film cue.txt"]);
+  const zip = E.makeZip(files);
+  assert.deepEqual(Array.from(zip.slice(0, 4)), [0x50, 0x4b, 0x03, 0x04]);
+  const end = zip.length - 22;
+  assert.deepEqual(Array.from(zip.slice(end, end + 4)), [0x50, 0x4b, 0x05, 0x06]);
+  assert.equal(zip[end + 10] | (zip[end + 11] << 8), files.length);
+  assert.equal(E.safeName('a/b:c?'), "a-b-c-");
 });

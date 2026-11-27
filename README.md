@@ -1,11 +1,13 @@
 # Learning Engine
 
-A personal adaptive tutor for:
+A personal adaptive tutor for the modules (class subjects) on your music course. It starts with:
 
 - **MIDI**: theory, protocol and practical use in DAWs
 - **Applied sound principles**: acoustics, signal processing, psychoacoustics
-- **Live sound**: PA setup, mic placement, gain staging, feedback management
-- **Your college assignments**: paste in a brief, learn the concepts it needs, get writing coaching, and quiz yourself on it
+- **Live sound practices**: PA setup, mic placement, gain staging, feedback management
+- **Music business and marketing**, **Creative project labs** and **Music composition**
+- **Your own modules**: add any class subject, with your course notes to guide the questions
+- **Your college assignments**, each filed in its module's folder: paste in a brief, learn the concepts it needs, get writing coaching, and quiz yourself on it
 
 It runs **online in Chrome** (nothing to install, easy to share), or on your Mac in the **terminal**. The AI can be a **free online API** or a **local model** (fully offline, Mac only).
 
@@ -140,8 +142,8 @@ Or run commands directly:
 | `python main.py backup` / `restore <file>` | Save all your work to one file, or restore it. The file also works in the online app |
 | `python main.py review` | Review weak spots across all topics, with an AI study plan. Add a topic to narrow it down, or `--no-plan` to skip the plan |
 | `python main.py topics` | Question counts, levels and accuracy |
-| `python main.py assignment add` | Paste in a new assignment brief and rubric |
-| `python main.py assignment list` | Your assignments and their ids |
+| `python main.py assignment add` | Paste in a new assignment brief and rubric, and choose which module's folder it goes in |
+| `python main.py assignment list` | Your assignments and their ids, grouped by module folder |
 | `python main.py assignment learn <id>` | Learn the key concepts the assignment needs, with follow-up questions |
 | `python main.py assignment write <id>` | Writing coach: plan, hints when you're stuck, feedback on your draft |
 | `python main.py assignment quiz <id>` | Adaptive quiz on that assignment's concepts |
@@ -160,6 +162,17 @@ When the terminal asks you to paste text, paste it, type `END` on its own line, 
 - If the bank runs out at your level, a new question is made on the spot.
 - **Spaced review:** every question you answer is scheduled to come back. Miss it and it's due again today; get it right (and not by guessing) and it comes back after 1, 3, 7, 14, then 30 days. The **Today** panel shows your daily streak, how many you've answered today and what's due.
 
+## Modules: one folder per class subject
+
+Open the **Modules** tab. Each module is a folder with its own questions, progress, spaced review, notes and assignments, so nothing mixes between subjects.
+
+- **Add a module**: give it a name, and optionally a short description and your course notes or syllabus. The questions follow your notes. Leave the subtopics blank and the AI suggests some.
+- **Open a module** to quiz it, review what's due, make questions, edit it, write your own notes (they save as you type), or **Download this folder** as a .zip.
+- **Assignments live inside a module.** Add an assignment from inside the module it belongs to. You can move it to another module from its **Brief** tab.
+- **Deleting a module** deletes its questions and progress, but never its assignments: they move to the **General** folder.
+- The starter modules can be renamed, edited or deleted like any other. Assignments you saved before modules existed are in **General**.
+- **Settings > Download everything as folders (.zip)** gives you one folder per module, each with its notes and its own assignments.
+
 ## Assignments: coaching, not ghost-writing
 
 The writing coach is built to help you write **your own** assignment. It explains concepts, suggests a structure as headings with guiding questions, gives hints when you're stuck, and gives feedback on your draft against the brief and rubric. It's instructed never to write paragraphs of the assignment for you or rewrite your text.
@@ -174,7 +187,8 @@ The terminal version stores JSON files in `data/`, and makes an automatic daily 
 
 - `data/questions/<topic>.json`: the question bank
 - `data/progress/<topic>.json`: answers, streaks, level and subtopic confidence
-- `data/assignments/<id>.json`: the brief, rubric, key concepts, outline and drafts with feedback
+- `data/assignments/<module>/<id>.json`: one folder per module, each holding only that module's assignments (brief, rubric, key concepts, outline and drafts with feedback). For example `data/assignments/composition/film-cue.json`. Assignments with no module go in `data/assignments/general/`. You can move an assignment by moving its file to another module's folder.
+- `data/modules.json`: modules you made in the browser app, after restoring a browser backup here
 
 These files are git-ignored, so they stay on your Mac. `python main.py backup` saves everything to one file you can also restore in the online app.
 

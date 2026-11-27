@@ -66,7 +66,8 @@ def trim(text: str, limit: int = config.MAX_CONTEXT_CHARS) -> str:
 
 
 def question_messages(topic_name: str, subtopic: str, difficulty: int,
-                      avoid: List[str], context: Optional[str] = None) -> List[Message]:
+                      avoid: List[str], context: Optional[str] = None,
+                      context_kind: str = "brief") -> List[Message]:
     level = config.DIFFICULTY_LABELS.get(difficulty, "")
     parts = [
         "Write ONE multiple-choice quiz question.",
@@ -75,8 +76,9 @@ def question_messages(topic_name: str, subtopic: str, difficulty: int,
         "Difficulty {}/5 ({}).".format(difficulty, level),
     ]
     if context:
-        parts.append("Base the question on this assignment brief:\n\"\"\"\n{}\n\"\"\"".format(
-            trim(context, 2500)))
+        lead = ("Use these notes about the student's course as a guide:" if context_kind == "notes"
+                else "Base the question on this assignment brief:")
+        parts.append(lead + "\n\"\"\"\n{}\n\"\"\"".format(trim(context, 2500)))
     if avoid:
         parts.append("Do NOT repeat these existing questions:\n- " + "\n- ".join(a[:120] for a in avoid))
     parts += [

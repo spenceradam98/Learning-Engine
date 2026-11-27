@@ -8,7 +8,7 @@
 <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://esm.run https://cdn.jsdelivr.net 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' https: http://localhost:* http://127.0.0.1:*; manifest-src 'self'; worker-src 'self'; base-uri 'none'; form-action 'none'; object-src 'none'">
 <meta name="referrer" content="no-referrer">
 <title>Learning Engine</title>
-<meta name="description" content="An adaptive tutor for MIDI, sound principles, live sound and your own assignments.">
+<meta name="description" content="An adaptive tutor for your music course modules and assignments.">
 <meta name="theme-color" content="#2563eb">
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="icons/icon.svg" type="image/svg+xml">
@@ -22,7 +22,7 @@
     <button data-tab="quiz" class="active">Quiz me</button>
     <button data-tab="generate">Generate</button>
     <button data-tab="review">Weak spots</button>
-    <button data-tab="assign">Assignments</button>
+    <button data-tab="assign">Modules</button>
     <button data-tab="settings">Settings</button>
   </nav>
   <span id="ai"></span>
@@ -84,19 +84,64 @@
   <!-- REVIEW -->
   <section id="tab-review" class="hidden"><div id="review-body"></div></section>
 
-  <!-- ASSIGNMENTS -->
+  <!-- MODULES (each one a folder holding its own assignments) -->
   <section id="tab-assign" class="hidden">
-    <div id="assign-list-view">
+    <div id="mod-list-view">
       <div class="card">
-        <div class="row" style="align-items:center"><h2 style="margin:0">Your assignments</h2>
+        <div class="row" style="align-items:center"><h2 style="margin:0">Your modules</h2>
+          <div style="flex:0 0 auto"><button class="btn" id="mod-new">Add a module</button></div></div>
+        <p class="muted">Each module is a folder for one class subject. It keeps its own questions, progress, notes and assignments.</p>
+        <div id="mod-list" class="folders"></div>
+      </div>
+      <div class="card hidden" id="mod-form">
+        <h2>Add a module</h2>
+        <label for="mf-name">Name</label><input id="mf-name" placeholder="e.g. Studio recording">
+        <label for="mf-desc">Short description (optional)</label><input id="mf-desc" placeholder="e.g. Recording bands in the studio, from mic choice to the final mix">
+        <label for="mf-notes">Course notes or syllabus (optional)</label>
+        <textarea id="mf-notes" style="min-height:90px" placeholder="Paste the module outline, learning outcomes or your class notes. Questions will follow them."></textarea>
+        <label for="mf-subs">Subtopics to be quizzed on (optional, one per line)</label>
+        <textarea id="mf-subs" style="min-height:90px" placeholder="Leave blank and the AI will suggest some."></textarea>
+        <div class="btns"><button class="btn" id="mf-save">Save module</button><button class="btn secondary" id="mf-cancel">Cancel</button></div>
+        <div id="mf-msg"></div>
+      </div>
+    </div>
+    <div id="mod-view" class="hidden">
+      <div class="card">
+        <div class="btns" style="margin-top:0"><button class="btn secondary" id="mv-back">← All modules</button></div>
+        <h2 id="mv-title" style="margin-top:12px"></h2>
+        <p class="muted" id="mv-desc"></p>
+        <p class="muted" id="mv-stats"></p>
+        <div class="btns"><button class="btn" id="mv-quiz">Quiz this module</button>
+          <button class="btn secondary" id="mv-review">Review due</button>
+          <button class="btn secondary" id="mv-gen">Make questions</button>
+          <button class="btn secondary" id="mv-edit">Edit module</button>
+          <button class="btn secondary" id="mv-zip">Download this folder</button></div>
+        <div id="mv-msg"></div>
+      </div>
+      <div class="card hidden" id="me-form">
+        <h2>Edit module</h2>
+        <label for="me-name">Name</label><input id="me-name">
+        <label for="me-desc">Short description</label><input id="me-desc">
+        <label for="me-notes">Course notes or syllabus</label><textarea id="me-notes" style="min-height:90px"></textarea>
+        <label for="me-subs">Subtopics (one per line)</label><textarea id="me-subs" style="min-height:110px"></textarea>
+        <div class="btns"><button class="btn" id="me-save">Save changes</button>
+          <button class="btn secondary" id="me-suggest">Suggest subtopics with AI</button>
+          <button class="btn secondary" id="me-cancel">Cancel</button></div>
+        <div id="me-msg"></div>
+        <details style="margin-top:12px"><summary class="muted">Delete this module</summary>
+          <p class="muted">Deletes this module's questions and progress. Its assignments are kept and move to the General folder.</p>
+          <button class="btn secondary" id="me-delete">Delete this module</button></details>
+      </div>
+      <div class="card">
+        <div class="row" style="align-items:center"><h2 style="margin:0">Assignments in this module</h2>
           <div style="flex:0 0 auto"><button class="btn" id="assign-new">Add assignment</button></div></div>
         <div id="assign-list" style="margin-top:8px"></div>
       </div>
       <div class="card hidden" id="assign-form">
-        <h2>Add an assignment</h2>
+        <h2>Add an assignment to <span id="af-mod"></span></h2>
         <div class="row">
           <div><label for="af-title">Title</label><input id="af-title" placeholder="e.g. Live sound report: festival stage"></div>
-          <div><label for="af-course">Course / module (optional)</label><input id="af-course"></div>
+          <div><label for="af-course">Course code (optional)</label><input id="af-course"></div>
           <div style="flex:0 1 160px"><label for="af-due">Due (optional)</label><input id="af-due" placeholder="e.g. 12 Dec"></div>
         </div>
         <label for="af-brief">Assignment brief (paste the whole task)</label><textarea id="af-brief"></textarea>
@@ -104,10 +149,14 @@
         <div class="btns"><button class="btn" id="af-save">Save</button><button class="btn secondary" id="af-cancel">Cancel</button></div>
         <div id="af-msg"></div>
       </div>
+      <div class="card">
+        <h2>My notes for this module <span class="saved-at" id="mv-notes-saved"></span></h2>
+        <textarea id="mv-notes" style="min-height:110px" placeholder="Class notes, links, things to revise. Saves automatically."></textarea>
+      </div>
     </div>
     <div id="assign-detail" class="hidden">
       <div class="card">
-        <div class="btns" style="margin-top:0"><button class="btn secondary" id="ad-back">← All assignments</button>
+        <div class="btns" style="margin-top:0"><button class="btn secondary" id="ad-back">← Back to module</button>
           <button class="btn secondary" id="ad-export">Download my work for this assignment</button></div>
         <h2 id="ad-title" style="margin-top:12px"></h2>
         <p class="muted" id="ad-meta"></p>
@@ -149,6 +198,10 @@
         <div id="aq-msg"></div>
       </div>
       <div class="card hidden" id="ad-brief"><div id="ad-brief-text" class="out"></div>
+        <div class="row" style="align-items:flex-end;margin-top:12px">
+          <div><label for="ad-move">Folder (module)</label><select id="ad-move"></select></div>
+          <div style="flex:0 0 auto"><button class="btn secondary" id="ad-move-go">Move</button></div></div>
+        <div id="ad-move-msg"></div>
         <div class="btns"><button class="btn secondary" id="ad-delete">Delete this assignment</button></div></div>
     </div>
   </section>
@@ -190,8 +243,10 @@
     <div class="card">
       <h2>Your work</h2>
       <p>Everything you do is saved automatically in this browser on this computer: your progress, question banks, assignments, drafts, notes and lessons.</p>
+      <p class="muted">The backup file is what you restore from. The .zip gives you one folder per module with its notes and assignments, to read or hand in.</p>
       <p class="muted">Clearing your browser's history and site data would delete it, and it doesn't move to other computers by itself. Download a backup now and then; you can open it on any computer with <b>Restore from a backup</b>.</p>
       <div class="btns"><button class="btn" id="bk-download">Download a backup</button>
+        <button class="btn secondary" id="bk-zip">Download everything as folders (.zip)</button>
         <label class="btn" for="bk-file">Restore from a backup</label>
         <input type="file" id="bk-file" accept=".json,application/json" class="hidden">
         <button class="btn secondary hidden" id="bk-legacy">Bring in my saved work from this computer's app folder</button></div>

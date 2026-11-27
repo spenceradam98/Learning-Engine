@@ -4,7 +4,7 @@
 // This mirrors the Python engine in ../engine (same data format), so backups
 // move between the two.
 
-export const APP_VERSION = "2.1.0";
+export const APP_VERSION = "2.2.0";
 
 // ---------------------------------------------------------------- settings ---
 
@@ -783,10 +783,11 @@ export function trim(text, limit) {
 }
 
 export const prompts = {
-  question(topicName, subtopic, difficulty, avoid, context) {
+  question(topicName, subtopic, difficulty, avoid, context, contextKind) {
     const parts = ["Write ONE multiple-choice quiz question.", "Topic: " + topicName, "Focus: " + subtopic,
       "Difficulty " + difficulty + "/5 (" + (DIFFICULTY_LABELS[difficulty] || "") + ")."];
-    if (context) parts.push('Base the question on this assignment brief:\n"""\n' + trim(context, 2500) + '\n"""');
+    if (context) parts.push((contextKind === "notes" ? "Use these notes about the student's course as a guide:" : "Base the question on this assignment brief:") +
+      '\n"""\n' + trim(context, 2500) + '\n"""');
     if (avoid && avoid.length) parts.push("Do NOT repeat these existing questions:\n- " + avoid.map((a) => a.slice(0, 120)).join("\n- "));
     parts.push("Rules: exactly 4 choices, exactly one correct, wrong choices must be plausible, no 'all of the above'. " +
       "answer_index is 0-3. Explanation is 1-3 sentences and says why the answer is right.",
@@ -1028,10 +1029,32 @@ export class Progress {
 
 const slug = (t) => (t.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40).replace(/-+$/, "") || "assignment");
 
+export const GENERAL_MODULE = "general";
+
+// Every assignment lives in exactly one module's folder. Assignments made
+// before modules existed (or whose module was deleted) go into "General".
 export class Assignments {
   constructor(store) { this.store = store; }
-  all() { return this.store.get("assignments", {}) || {}; }
-  list() { return Object.values(this.all()).sort((a, b) => a.id.localeCompare(b.id)); }
+  all() {
+    const all = this.store.get("assignments", {}) || {};
+    const mods = new Modules(this.store);
+    let changed = false;
+    for (const a of Object.values(all)) {
+      if (!a.module || !mods.has(a.module)) { a.module = ensureGeneralModule(this.store); changed = true; }
+    }
+    if (changed) this.store.set("assignments", all);
+    return all;
+  }
+  list(module) {
+    return Object.values(this.all()).filter((a) => !module || a.module === module).sort((a, b) => a.title.localeCompare(b.title));
+  }
+  move(id, module) {
+    if (!new Modules(this.store).has(module)) throw new Error("That module no longer exists.");
+    const a = this.get(id);
+    a.module = module;
+    this.save(a);
+    return a;
+  }
   get(id) { const a = this.all()[id]; if (!a) throw new Error("That assignment no longer exists."); return a; }
   save(a) { const all = this.all(); a.updated_at = nowIso(); all[a.id] = a; this.store.set("assignments", all); }
   add(f) {
@@ -1041,7 +1064,8 @@ export class Assignments {
     while (all[id]) id = base + "-" + n++;
     const a = {id, title: f.title.trim(), course: (f.course || "").trim(), due: (f.due || "").trim(),
       brief_text: f.brief.trim(), rubric_text: (f.rubric || "").trim(), concepts: [], outline: "", drafts: [],
-      working_draft: "", notes: "", lessons: {}, hints: [], created_at: nowIso()};
+      working_draft: "", notes: "", lessons: {}, hints: [], created_at: nowIso(),
+      module: new Modules(this.store).has(f.module) ? f.module : ensureGeneralModule(this.store)};
     this.save(a);
     return a;
   }
@@ -1091,18 +1115,171 @@ export function assignmentMarkdown(a) {
 
 // ----------------------------------------------------------------- topics ---
 
+// ---------------------------------------------------------------- modules ---
+// A module is a class subject you study (MIDI, Music composition, ...). Each
+// one has its own question bank, progress, spaced review and notes. Modules
+// live in this browser's storage; the first time the app runs it creates the
+// built-in ones plus some starter modules, all of which you can edit or delete.
+
+export const STARTER_MODULES = {
+  "music-business": {
+    name: "Music business and marketing",
+    description: "How the music industry works and how artists earn, promote and protect their music.",
+    subtopics: ["copyright, publishing and ownership", "royalties and collecting societies", "record deals and contracts",
+      "streaming, distribution and release planning", "music marketing and social media", "branding and building an audience",
+      "live music business and touring", "music industry careers, networking and freelancing"],
+  },
+  "creative-labs": {
+    name: "Creative project labs",
+    description: "Planning, making and reflecting on creative music projects.",
+    subtopics: ["reading a brief and planning a project", "creative research and reference tracks", "collaboration and teamwork",
+      "production workflow and file management", "critical listening and giving feedback", "reflective practice and evaluation",
+      "presenting and pitching your work", "time management and meeting deadlines"],
+  },
+  "composition": {
+    name: "Music composition",
+    description: "Writing and developing musical ideas, from melody and harmony to form and arranging.",
+    subtopics: ["melody writing", "harmony and chord progressions", "rhythm and groove", "song structure and form",
+      "motifs and thematic development", "arranging and orchestration", "counterpoint and voice leading", "composing for film, games and media"],
+  },
+};
+
+function seedModules(store) {
+  const mods = {};
+  for (const [k, t] of Object.entries(TOPICS)) mods[k] = {key: k, name: t.name, description: "", notes: "", my_notes: "", subtopics: t.subtopics.slice(), created_at: nowIso()};
+  mods.live.name = "Live sound practices (PA setup, mic placement, gain staging, feedback)";
+  for (const [k, t] of Object.entries(STARTER_MODULES)) mods[k] = Object.assign({key: k, notes: "", my_notes: "", created_at: nowIso()}, JSON.parse(JSON.stringify(t)));
+  // Anything already studied under a name we don't know becomes a module, so no work is lost.
+  for (const k of store.keys("questions:").concat(store.keys("progress:"))) {
+    if (!mods[k] && !k.startsWith(ASSIGNMENT_PREFIX) && SAFE_KEY.test(k))
+      mods[k] = {key: k, name: k.replace(/-/g, " "), description: "", notes: "", my_notes: "", subtopics: ["general"], created_at: nowIso()};
+  }
+  return mods;
+}
+
+export class Modules {
+  constructor(store) { this.store = store; }
+  all() {
+    let mods = this.store.get("modules", null);
+    if (!mods || typeof mods !== "object") {
+      mods = seedModules(this.store);
+      this.store.set("modules", mods);
+    }
+    return mods;
+  }
+  list() { return Object.values(this.all()).sort((a, b) => a.name.localeCompare(b.name)); }
+  has(key) { return !!this.all()[key]; }
+  get(key) { const m = this.all()[key]; if (!m) throw new Error("That module no longer exists."); return m; }
+  save(m) { const all = this.all(); m.updated_at = nowIso(); all[m.key] = m; this.store.set("modules", all); }
+  add(f) {
+    const name = (f.name || "").trim();
+    if (!name) throw new Error("Give the module a name.");
+    const all = this.all();
+    if (Object.values(all).some((m) => m.name.toLowerCase() === name.toLowerCase())) throw new Error("You already have a module called that.");
+    let base = slug(name);
+    if (base.startsWith(ASSIGNMENT_PREFIX)) base = "m-" + base;
+    let key = base, n = 2;
+    while (all[key] || this.store.get("questions:" + key, null) || this.store.get("progress:" + key, null)) key = base + "-" + n++;
+    const m = {key, name: name.slice(0, 120), description: (f.description || "").trim().slice(0, 500), notes: (f.notes || "").trim(),
+      my_notes: "", subtopics: cleanSubtopics(f.subtopics), created_at: nowIso()};
+    this.save(m);
+    return m;
+  }
+  update(key, f) {
+    const m = this.get(key);
+    if (f.name !== undefined) {
+      const name = String(f.name).trim();
+      if (!name) throw new Error("Give the module a name.");
+      if (this.list().some((x) => x.key !== key && x.name.toLowerCase() === name.toLowerCase())) throw new Error("You already have a module called that.");
+      m.name = name.slice(0, 120);
+    }
+    if (f.description !== undefined) m.description = String(f.description).trim().slice(0, 500);
+    if (f.notes !== undefined) m.notes = String(f.notes).trim();
+    if (f.my_notes !== undefined) m.my_notes = String(f.my_notes);
+    if (f.subtopics !== undefined) m.subtopics = cleanSubtopics(f.subtopics);
+    this.save(m);
+    return m;
+  }
+  // Deletes the module with its questions and progress. Its assignments are
+  // never deleted with it: they move to the "General" folder.
+  remove(key) {
+    const all = this.all();
+    delete all[key];
+    this.store.set("modules", all);
+    this.store.remove("questions:" + key);
+    this.store.remove("progress:" + key);
+    const asg = this.store.get("assignments", {}) || {};
+    const moved = Object.values(asg).filter((a) => a.module === key);
+    if (moved.length) {
+      const general = key === GENERAL_MODULE ? null : ensureGeneralModule(this.store);
+      if (!general) {  // deleting General itself while it holds work: recreate it
+        const a2 = this.all(); a2[GENERAL_MODULE] = {key: GENERAL_MODULE, name: "General", description: "", notes: "", my_notes: "",
+          subtopics: ["study skills and key ideas"], created_at: nowIso()}; this.store.set("modules", a2);
+      }
+      for (const a of moved) a.module = GENERAL_MODULE;
+      this.store.set("assignments", asg);
+    }
+    return moved.length;
+  }
+}
+
+export function ensureGeneralModule(store) {
+  const mods = new Modules(store);
+  if (!mods.has(GENERAL_MODULE)) {
+    const all = mods.all();
+    all[GENERAL_MODULE] = {key: GENERAL_MODULE, name: "General", description: "Assignments that aren't in a specific module yet.",
+      notes: "", my_notes: "", subtopics: ["study skills and key ideas"], created_at: nowIso()};
+    store.set("modules", all);
+  }
+  return GENERAL_MODULE;
+}
+
+export function cleanSubtopics(v) {
+  const list = (Array.isArray(v) ? v : String(v || "").split(/\n|;/)).map((x) => String(x).replace(/^\s*[-*•\d.)]+\s*/, "").trim())
+    .filter(Boolean).map((x) => x.slice(0, 120));
+  const uniq = Array.from(new Set(list)).slice(0, 12);
+  return uniq.length ? uniq : [];
+}
+
+const SUBTOPICS_SCHEMA = {type: "object", properties: {subtopics: {type: "array", items: {type: "string"}, minItems: 4, maxItems: 10}}, required: ["subtopics"]};
+export function validateSubtopics(obj) {
+  const items = obj && !Array.isArray(obj) ? obj.subtopics : obj;
+  if (!Array.isArray(items)) throw new Error("expected a list of subtopics");
+  const out = cleanSubtopics(items.map((x) => (x && typeof x === "object" ? x.name : x)));
+  if (out.length < 3) throw new Error("need at least 3 subtopics");
+  return out.slice(0, 10);
+}
+
+// Asks the AI to split a new module into 6-8 study areas, guided by its notes.
+export async function suggestSubtopics(llm, m) {
+  const parts = ["A college music technology student is studying the module \"" + m.name + "\"."];
+  if (m.description) parts.push("Description: " + m.description);
+  if (m.notes) parts.push('Course notes or syllabus:\n"""\n' + trim(m.notes, 3000) + '\n"""');
+  parts.push("List 6-8 subtopics to quiz them on, each a short phrase, covering the module evenly. " +
+    'Reply ONLY with JSON like: {"subtopics": ["copyright basics", "royalties"]}');
+  return llm.chatJson([{role: "system", content: "You plan college courses. You reply only with JSON."}, {role: "user", content: parts.join("\n")}],
+    SUBTOPICS_SCHEMA, validateSubtopics, {temperature: 0.3, maxTokens: 400});
+}
+
 export function topicInfo(store, key) {
-  if (TOPICS[key]) return {key, name: TOPICS[key].name, subtopics: TOPICS[key].subtopics.slice(), context: null};
   if (key.startsWith(ASSIGNMENT_PREFIX)) {
     const a = new Assignments(store).get(key.slice(ASSIGNMENT_PREFIX.length));
     const subs = (a.concepts || []).map((c) => c.name);
-    return {key, name: "Assignment: " + a.title, subtopics: subs.length ? subs : ["key ideas in the brief"], context: a.brief_text};
+    return {key, name: "Assignment: " + a.title, subtopics: subs.length ? subs : ["key ideas in the brief"], context: a.brief_text, contextKind: "brief"};
+  }
+  const mods = new Modules(store);
+  if (mods.has(key)) {
+    const m = mods.get(key);
+    const context = [m.description, m.notes].filter(Boolean).join("\n\n");
+    return {key, name: m.name, subtopics: m.subtopics && m.subtopics.length ? m.subtopics.slice() : ["key ideas of " + m.name],
+      context: context || null, contextKind: "notes"};
   }
   throw new Error("Unknown topic " + key);
 }
 
 export function allTopicKeys(store) {
-  return Object.keys(TOPICS).concat(new Assignments(store).list().map((a) => ASSIGNMENT_PREFIX + a.id));
+  const asg = new Assignments(store).list();  // first, so old assignments are filed into General before modules are listed
+  return new Modules(store).list().map((m) => m.key).concat(asg.map((a) => ASSIGNMENT_PREFIX + a.id));
 }
 
 // -------------------------------------------------------------- generator ---
@@ -1113,7 +1290,7 @@ export function planDifficulties(n, centre) {
 }
 
 export async function generateOne(llm, bank, info, subtopic, difficulty, source) {
-  const cleaned = await llm.chatJson(prompts.question(info.name, subtopic, difficulty, bank.recentTexts(subtopic, 6), info.context),
+  const cleaned = await llm.chatJson(prompts.question(info.name, subtopic, difficulty, bank.recentTexts(subtopic, 6), info.context, info.contextKind),
     QUESTION_SCHEMA, validateQuestion, {temperature: 0.6, maxTokens: 500});
   return bank.add(cleaned, subtopic, difficulty, source);
 }
@@ -1248,6 +1425,70 @@ export function stats(store, today) {
     dueTotal: due.reduce((a, r) => a + r.due, 0), due};
 }
 
+// ----------------------------------------------------- folder downloads ---
+// A .zip with one folder per module, each holding its own notes and its own
+// assignments, so the downloaded files are organised the same way as the app.
+
+const CRC_TABLE = (() => {
+  const t = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1; t[n] = c >>> 0; }
+  return t;
+})();
+function crc32(bytes) {
+  let c = 0xFFFFFFFF;
+  for (let i = 0; i < bytes.length; i++) c = CRC_TABLE[(c ^ bytes[i]) & 0xFF] ^ (c >>> 8);
+  return (c ^ 0xFFFFFFFF) >>> 0;
+}
+// Minimal "stored" (uncompressed) zip writer: [{path, text}] -> Uint8Array.
+export function makeZip(files) {
+  const enc = new TextEncoder(), parts = [], central = [];
+  let offset = 0;
+  const u16 = (v) => [v & 0xFF, (v >>> 8) & 0xFF];
+  const u32 = (v) => [v & 0xFF, (v >>> 8) & 0xFF, (v >>> 16) & 0xFF, (v >>> 24) & 0xFF];
+  for (const f of files) {
+    const name = enc.encode(f.path), data = enc.encode(f.text), crc = crc32(data);
+    const common = [...u16(20), ...u16(0x0800), ...u16(0), ...u16(0), ...u16(0x21), ...u32(crc), ...u32(data.length), ...u32(data.length), ...u16(name.length), ...u16(0)];
+    const local = new Uint8Array([...u32(0x04034b50), ...common]);
+    parts.push(local, name, data);
+    central.push(new Uint8Array([...u32(0x02014b50), ...u16(20), ...common, ...u16(0), ...u16(0), ...u16(0), ...u32(0), ...u32(offset)]), name);
+    offset += local.length + name.length + data.length;
+  }
+  const cdSize = central.reduce((n, p) => n + p.length, 0);
+  const end = new Uint8Array([...u32(0x06054b50), ...u16(0), ...u16(0), ...u16(files.length), ...u16(files.length), ...u32(cdSize), ...u32(offset), ...u16(0)]);
+  const all = parts.concat(central, [end]), out = new Uint8Array(all.reduce((n, p) => n + p.length, 0));
+  let pos = 0;
+  for (const p of all) { out.set(p, pos); pos += p.length; }
+  return out;
+}
+
+export function safeName(s) {
+  return String(s || "untitled").replace(/[\\/:*?"<>|\x00-\x1f]+/g, "-").replace(/\s+/g, " ").trim().slice(0, 60) || "untitled";
+}
+
+export function moduleText(m) {
+  const out = ["# " + m.name, ""];
+  if (m.description) out.push(m.description, "");
+  out.push("## Subtopics", "", ...(m.subtopics || []).map((x) => "- " + x), "");
+  if (m.notes) out.push("## Course notes", "", m.notes, "");
+  if (m.my_notes) out.push("## My notes", "", m.my_notes, "");
+  return out.join("\n");
+}
+
+// Files for one module (or every module), laid out as folders.
+export function moduleFiles(store, onlyKey) {
+  const files = [], used = new Set();
+  const mods = new Modules(store), asg = new Assignments(store);
+  for (const m of mods.list()) {
+    if (onlyKey && m.key !== onlyKey) continue;
+    let folder = safeName(m.name.replace(/\s*\(.*\)\s*$/, ""));
+    while (used.has(folder)) folder += " (" + m.key + ")";
+    used.add(folder);
+    files.push({path: folder + "/About this module.txt", text: moduleText(m)});
+    for (const a of asg.list(m.key)) files.push({path: folder + "/Assignments/" + safeName(a.title) + ".txt", text: assignmentMarkdown(a)});
+  }
+  return files;
+}
+
 // ---------------------------------------------------------- backup/restore ---
 // The same file format as `python main.py backup`. Your API key is never included.
 
@@ -1256,6 +1497,7 @@ export function exportBackup(store) {
   for (const k of store.keys("questions:")) out.questions[k] = store.get("questions:" + k, []);
   for (const k of store.keys("progress:")) out.progress[k] = store.get("progress:" + k, {});
   out.assignments = store.get("assignments", {}) || {};
+  out.modules = new Modules(store).all();
   return out;
 }
 
@@ -1291,10 +1533,29 @@ export function importBackup(store, data) {
     all[id] = a; counts.assignments++;
   }
   store.set("assignments", all);
+  // Modules: add or update the ones in the file; make sure every imported bank has a module.
+  const mods = new Modules(store), have = mods.all();
+  counts.modules = 0;
+  for (const [k, m] of Object.entries(data.modules || {})) {
+    if (!SAFE_KEY.test(k) || k.startsWith(ASSIGNMENT_PREFIX) || !m || typeof m !== "object" || !String(m.name || "").trim()) continue;
+    have[k] = {key: k, name: String(m.name).trim().slice(0, 120), description: String(m.description || "").slice(0, 500),
+      notes: String(m.notes || ""), my_notes: String(m.my_notes || ""), subtopics: cleanSubtopics(m.subtopics || []),
+      created_at: m.created_at || nowIso()};
+    counts.modules++;
+  }
+  // Banks, and assignment folders from the terminal version, that have no module yet get one.
+  const asgModules = Object.values(data.assignments || {}).map((a) => (a && typeof a.module === "string" ? a.module : "")).filter(Boolean);
+  for (const k of Object.keys(data.questions || {}).concat(Object.keys(data.progress || {}), asgModules)) {
+    if (SAFE_KEY.test(k) && !k.startsWith(ASSIGNMENT_PREFIX) && !have[k])
+      have[k] = {key: k, name: k === GENERAL_MODULE ? "General" : TOPICS[k] ? TOPICS[k].name : k.replace(/-/g, " "), description: "", notes: "", my_notes: "",
+        subtopics: TOPICS[k] ? TOPICS[k].subtopics.slice() : ["general"], created_at: nowIso()};
+  }
+  store.set("modules", have);
   store.set("meta", Object.assign(store.get("meta", {}) || {}, {last_import: nowIso()}));
   return counts;
 }
 
 export function hasAnyWork(store) {
+  // (modules alone don't count: everyone starts with some)
   return store.keys("progress:").length > 0 || store.keys("questions:").length > 0 || new Assignments(store).list().length > 0;
 }
