@@ -4,11 +4,28 @@
 // This mirrors the Python engine in ../engine (same data format), so backups
 // move between the two.
 
-export const APP_VERSION = "2.0.0";
+export const APP_VERSION = "2.2.0";
 
 // ---------------------------------------------------------------- settings ---
 
+// "kind" says how we talk to it: "http" (OpenAI-style web API), "chrome"
+// (Chrome's built-in Gemini Nano), "webllm" (a model downloaded into the
+// browser) or "auto" (the best no-setup option that works, with fallbacks).
 export const PROVIDERS = {
+  auto: {
+    kind: "auto", label: "Automatic (no setup)", url: "", model: "", needsKey: false, keyless: true,
+  },
+  chrome: {
+    kind: "chrome", label: "Chrome's built-in AI", url: "", model: "Gemini Nano", needsKey: false, keyless: true,
+  },
+  pollinations: {
+    kind: "http", label: "Free shared AI (Pollinations)",
+    url: "https://text.pollinations.ai/openai", model: "", needsKey: false, keyless: true, slow: true,
+  },
+  webllm: {
+    kind: "webllm", label: "Private AI on this computer", url: "", model: "Qwen2.5-1.5B-Instruct-q4f16_1-MLC",
+    needsKey: false, keyless: true,
+  },
   gemini: {
     label: "Google Gemini (free tier)",
     url: "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
@@ -33,7 +50,7 @@ export const PROVIDERS = {
     localOnly: true,
   },
 };
-export const DEFAULT_PROVIDER = "gemini";
+export const DEFAULT_PROVIDER = "auto";
 
 export const TOPICS = {
   midi: {
@@ -149,22 +166,34 @@ export function isLocalPage(loc) {
   return h === "localhost" || h === "127.0.0.1";
 }
 
-export function loadSettings(store) {
+// Settings remember a key and model per service, so switching to a no-setup
+// option and back doesn't lose your key. Older single-service settings still load.
+export function loadSettings(store, providerOverride) {
   const s = store.get("settings", {}) || {};
-  const provider = PROVIDERS[s.provider] ? s.provider : DEFAULT_PROVIDER;
-  const p = PROVIDERS[provider];
+  const saved = Object.assign({}, s.saved || {});
+  if (s.provider && !s.saved && PROVIDERS[s.provider])
+    saved[s.provider] = {url: s.url || "", model: s.model || "", apiKey: s.apiKey || ""};
+  let provider = providerOverride || s.provider;
+  if (!PROVIDERS[provider]) provider = DEFAULT_PROVIDER;
+  const p = PROVIDERS[provider], mine = saved[provider] || {};
   return {
-    provider, label: p.label,
-    url: (provider === "custom" ? s.url : p.url) || p.url,
-    model: s.model || p.model,
-    apiKey: s.apiKey || "",
-    needsKey: p.needsKey,
+    provider, label: p.label, kind: p.kind,
+    url: (provider === "custom" ? mine.url : p.url) || p.url,
+    model: (p.kind === "http" && mine.model) || p.model,
+    apiKey: mine.apiKey || "",
+    needsKey: p.needsKey, keyless: !!p.keyless,
   };
 }
 export function saveSettings(store, s) {
-  store.set("settings", {provider: s.provider, url: s.url || "", model: s.model || "", apiKey: s.apiKey || ""});
+  const cur = store.get("settings", {}) || {};
+  const saved = Object.assign({}, cur.saved || {});
+  if (cur.provider && !cur.saved && PROVIDERS[cur.provider])
+    saved[cur.provider] = {url: cur.url || "", model: cur.model || "", apiKey: cur.apiKey || ""};
+  saved[s.provider] = {url: s.url || "", model: s.model || "", apiKey: s.apiKey || ""};
+  store.set("settings", {provider: s.provider, saved});
 }
 export function isConfigured(settings) {
+  if (settings.keyless) return true;
   return !!(settings.url && (!settings.needsKey || settings.apiKey));
 }
 
@@ -174,6 +203,35 @@ export class LLMError extends Error {}
 
 const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
 
+export const ONLINE_TIMEOUT_SEC = 45;   // wait this long for an online service to start answering
+export const LOCAL_TIMEOUT_SEC = 300;   // a local model on an old Mac is slow
+export const STREAM_IDLE_SEC = 60;      // give up if a streamed answer goes quiet this long
+
+// Pulls the human-readable message out of an error reply (OpenAI or Google style).
+export function errorMessage(text) {
+  try {
+    let d = JSON.parse(text);
+    if (Array.isArray(d)) d = d[0];
+    const e = d && (d.error || d);
+    const m = e && (e.message || (typeof e === "string" ? e : ""));
+    if (m) return String(m).slice(0, 300);
+  } catch (e) { /* not JSON */ }
+  return String(text || "").replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim().slice(0, 200);
+}
+
+// Gemini 2.5+ "thinks" before answering, which is slow and eats the answer's
+// token budget. Turn it off (Flash) or down (Pro, Gemini 3) for quick replies.
+export function reasoningEffort(provider, model) {
+  if (provider !== "gemini") return null;
+  const m = String(model || "").toLowerCase();
+  if (/2\.5-flash/.test(m)) return "none";
+  if (/gemini-(2\.5|[3-9])/.test(m)) return "low";
+  return null;
+}
+
+class Timeout extends Error {}
+class NetworkFail extends Error {}
+
 export class LLM {
   constructor(settings, opts) {
     opts = opts || {};
@@ -181,9 +239,18 @@ export class LLM {
     this.fetch = opts.fetch || ((...a) => fetch(...a));
     this.sleep = opts.sleep || ((sec) => sleepMs(sec * 1000));
     this.isLocal = settings.provider === "local";
+    this.timeoutSec = opts.timeoutSec || (this.isLocal ? LOCAL_TIMEOUT_SEC : ONLINE_TIMEOUT_SEC);
+    this.idleSec = opts.idleSec || (this.isLocal ? LOCAL_TIMEOUT_SEC : STREAM_IDLE_SEC);
     this.schemaOk = this.isLocal;
+    this.reasoning = reasoningEffort(settings.provider, settings.model);
+    this.onRetry = opts.onRetry || (() => {});  // (try number, of how many); 0 = done
+    // Free shared services ask you to wait between requests (HTTP 402/429 with
+    // Retry-After); allow longer waits and more tries for them.
+    this.shared = !!(PROVIDERS[settings.provider] || {}).slow;
+    this.delays = opts.delays || (this.shared ? [5, 15, 30, 45, 60] : BUSY_RETRY_DELAYS);
+    this.maxWait = this.shared ? 75 : 30;
   }
-  describe() { return this.isLocal ? "local model" : this.s.label + " · " + this.s.model; }
+  describe() { return this.isLocal ? "local model" : this.s.label + (this.s.model ? " · " + this.s.model : ""); }
   headers() {
     const h = {"Content-Type": "application/json"};
     if (this.s.apiKey) h.Authorization = "Bearer " + this.s.apiKey;
@@ -192,47 +259,102 @@ export class LLM {
   }
   payload(messages, temperature, maxTokens, stream, schema) {
     const p = {model: this.s.model || "local", messages, temperature, max_tokens: maxTokens, stream: !!stream};
+    if (this.shared) {
+      delete p.model;   // let the free service use its default free model
+      p.stream = false; // and ask for whole answers (streaming isn't documented there)
+      p.max_tokens = maxTokens + 1500;  // its default model reasons before answering
+    }
+    if (this.s.provider === "gemini") p.max_tokens = maxTokens + 2048;  // room for any thinking
+    if (this.reasoning) p.reasoning_effort = this.reasoning;
     if (schema && this.schemaOk) p.response_format = {type: "json_object", schema};
     return p;
   }
   async postOnce(payload) {
+    const ctl = typeof AbortController !== "undefined" ? new AbortController() : null;
+    let timedOut = false;
+    const timer = setTimeout(() => { timedOut = true; if (ctl) ctl.abort(); }, this.timeoutSec * 1000);
     try {
-      return await this.fetch(this.s.url, {method: "POST", headers: this.headers(), body: JSON.stringify(payload)});
+      return await this.fetch(this.s.url, {method: "POST", headers: this.headers(), body: JSON.stringify(payload),
+        signal: ctl ? ctl.signal : undefined});
     } catch (e) {
-      if (this.isLocal) throw new LLMError("Can't reach the local model. Is llama-server running?");
-      throw new LLMError("Can't reach " + this.s.label + ". Check your internet connection.");
+      if (timedOut) throw new Timeout();
+      throw new NetworkFail(e && e.message);
+    } finally {
+      clearTimeout(timer);
     }
+  }
+  offlineOr(msg) {
+    if (typeof navigator !== "undefined" && navigator.onLine === false)
+      return new LLMError("This computer seems to be offline. Check your internet connection and try again.");
+    return new LLMError(msg);
   }
   async post(payload) {
     if (!this.s.url) throw new LLMError("No AI chosen yet. Open Settings and pick one.");
     if (this.s.needsKey && !this.s.apiKey) throw new LLMError("No API key yet. Open Settings and paste your free key.");
-    const delays = BUSY_RETRY_DELAYS.slice();
+    const delays = this.delays.slice(), total = this.delays.length;
+    const name = this.s.label + (this.s.model ? " (" + this.s.model + ")" : "");
     for (;;) {
-      const r = await this.postOnce(payload);
-      if ((r.status === 503 || r.status === 429) && delays.length) {
+      let r;
+      try {
+        r = await this.postOnce(payload);
+      } catch (e) {
+        if (this.isLocal) {
+          if (e instanceof Timeout) throw new LLMError("The local model took longer than " + this.timeoutSec + " seconds. Try again or use a smaller model.");
+          throw new LLMError("Can't reach the local model. Is llama-server running?");
+        }
+        // A busy or rate-limited service sometimes answers in a way the browser
+        // can only see as a dropped connection, so treat it like "busy": retry.
+        if (delays.length) {
+          this.onRetry(total - delays.length + 1, total);
+          await this.sleep(delays.shift());
+          continue;
+        }
+        this.onRetry(0);
+        if (e instanceof Timeout)
+          throw this.offlineOr(name + " didn't answer within " + this.timeoutSec + " seconds, even after a few tries. " +
+            "It's probably overloaded. Wait a minute and try again, or pick a lighter model (such as gemini-2.5-flash-lite) or another service in Settings.");
+        throw this.offlineOr("Couldn't get an answer from " + name + ", even after a few tries. Usually this means the free service is " +
+          "overloaded or your free daily limit is used up. Wait a minute and try again, or pick another model or service in Settings.");
+      }
+      if ([402, 429, 500, 502, 503, 504].includes(r.status) && (r.status !== 402 || this.shared) && delays.length) {
         let wait = delays.shift();
         const ra = parseFloat((r.headers && r.headers.get && r.headers.get("Retry-After")) || "0");
-        if (ra > wait) wait = Math.min(30, ra);
+        if (ra > wait) wait = Math.min(this.maxWait, ra);
+        this.onRetry(total - delays.length, total, wait);
         await this.sleep(wait);
         continue;
       }
+      this.onRetry(0);
+      if (r.ok) return r;
+      const text = await r.text().catch(() => "");
+      const msg = errorMessage(text);
+      const low = msg.toLowerCase();
       if (r.status === 400 && payload.response_format) {
         this.schemaOk = false;
         payload = Object.assign({}, payload);
         delete payload.response_format;
         continue;
       }
-      if (r.ok) return r;
-      const text = await r.text().catch(() => "");
-      if (r.status === 401 || r.status === 403)
-        throw new LLMError("The AI service rejected your key (HTTP " + r.status + "). Check it in Settings.");
+      if (r.status === 400 && payload.reasoning_effort && /reason|think/.test(low)) {
+        this.reasoning = null;  // this model can't change its thinking: ask without it
+        payload = Object.assign({}, payload);
+        delete payload.reasoning_effort;
+        continue;
+      }
+      if (r.status === 401 || r.status === 403 || (r.status === 400 && /api.?key/.test(low)))
+        throw new LLMError("The AI service rejected your key. Copy it again from the provider's website, paste it in Settings and click Save." +
+          (msg ? " (It said: " + msg + ")" : ""));
+      if (this.shared && (r.status === 402 || r.status === 429))
+        throw new LLMError("The free shared AI is busy with other people right now. Wait a minute and try again, " +
+          "or choose another option in Settings (your own free key is much faster).");
       if (r.status === 429)
-        throw new LLMError("The free API's rate limit was hit. Wait a minute and try again.");
-      if (r.status === 503)
-        throw new LLMError(this.s.label + " is overloaded right now. Wait a minute and try again, or pick a different model in Settings.");
+        throw new LLMError("You've hit the free usage limit for " + name + ". Wait a minute (or until tomorrow for a daily limit), or pick another model in Settings." +
+          (msg ? " (It said: " + msg + ")" : ""));
+      if (r.status >= 500)
+        throw new LLMError(name + " is overloaded right now. Wait a minute and try again, or pick a different model in Settings.");
       if (r.status === 404)
-        throw new LLMError("The AI service doesn't know the model '" + this.s.model + "'. Pick another one in Settings.");
-      throw new LLMError("AI service error HTTP " + r.status + ": " + text.slice(0, 200));
+        throw new LLMError("The AI service doesn't know the model '" + this.s.model + "'. Pick another one in Settings." + (msg ? " (It said: " + msg + ")" : ""));
+      throw new LLMError("The AI service said: " + (msg || "error HTTP " + r.status) + " (HTTP " + r.status + ")");
     }
   }
   async chat(messages, opts) {
@@ -247,7 +369,16 @@ export class LLM {
   // Yields text chunks as the model writes them.
   async *stream(messages, opts) {
     opts = opts || {};
-    const r = await this.post(this.payload(messages, opts.temperature ?? 0.7, opts.maxTokens || 700, true));
+    const payload = this.payload(messages, opts.temperature ?? 0.7, opts.maxTokens || 700, true);
+    const r = await this.post(payload);
+    if (!payload.stream) {  // service answered in one go
+      let data;
+      try { data = await r.json(); } catch (e) { throw new LLMError("Unexpected reply from the AI service."); }
+      const text = (((data.choices || [])[0] || {}).message || {}).content || "";
+      if (!text) throw new LLMError("The AI sent an empty answer. Try again.");
+      yield text;
+      return;
+    }
     if (!r.body || !r.body.getReader) {  // no streaming support: return it in one go
       yield* parseSse(await r.text());
       return;
@@ -255,9 +386,20 @@ export class LLM {
     const reader = r.body.getReader(), dec = new TextDecoder();
     let buf = "";
     for (;;) {
-      const {done, value} = await reader.read();
-      if (done) break;
-      buf += dec.decode(value, {stream: true});
+      let timer;
+      const idle = new Promise((_, reject) => { timer = setTimeout(() => reject(new Timeout()), this.idleSec * 1000); });
+      let res;
+      try {
+        res = await Promise.race([reader.read(), idle]);
+      } catch (e) {
+        reader.cancel().catch(() => {});
+        if (e instanceof Timeout) throw new LLMError("The AI stopped answering part way through. Try again.");
+        throw new LLMError("The connection dropped part way through the answer. Try again.");
+      } finally {
+        clearTimeout(timer);
+      }
+      if (res.done) break;
+      buf += dec.decode(res.value, {stream: true});
       let nl;
       while ((nl = buf.indexOf("\n")) >= 0) {
         const line = buf.slice(0, nl); buf = buf.slice(nl + 1);
@@ -286,9 +428,198 @@ export class LLM {
     throw new LLMError("The AI kept returning unusable output (" + lastError + ").");
   }
   async check() {
-    const reply = await this.chat([{role: "user", content: "Reply with the word OK."}], {temperature: 0, maxTokens: 5});
-    return "Connected to " + this.describe() + ". It replied: " + reply.trim().slice(0, 40);
+    const reply = await this.chat([{role: "user", content: "Reply with the word OK."}], {temperature: 0, maxTokens: 20});
+    return "Connected to " + this.describe() + ". It replied: " + (reply.trim().slice(0, 40) || "(an empty reply, but the connection works)");
   }
+}
+
+// ------------------------------------------------- no-setup AI options ---
+
+// Chrome's built-in AI (Gemini Nano): free, private (stays on the computer), no key.
+// Needs a recent Chrome on a fairly powerful computer (Google: macOS 13+ or
+// Windows 10/11, 16 GB RAM). Returns "available", "downloadable",
+// "downloading" or "unavailable".
+export async function chromeAIStatus(g) {
+  g = g || globalThis;
+  try {
+    if (!g.LanguageModel || !g.LanguageModel.availability) return "unavailable";
+    return await g.LanguageModel.availability({expectedInputs: [{type: "text", languages: ["en"]}],
+      expectedOutputs: [{type: "text", languages: ["en"]}]});
+  } catch (e) { return "unavailable"; }
+}
+
+function splitMessages(messages) {
+  const system = messages.filter((m) => m.role === "system").map((m) => m.content).join("\n\n");
+  const rest = messages.filter((m) => m.role !== "system");
+  const last = rest.pop() || {content: ""};
+  return {system, history: rest, prompt: last.content};
+}
+
+export class ChromeLLM extends LLM {
+  constructor(settings, opts) {
+    super(Object.assign({}, settings, {provider: "chrome", label: PROVIDERS.chrome.label, model: "Gemini Nano", url: "chrome"}), opts);
+    this.g = (opts && opts.global) || globalThis;
+    this.onProgress = (opts && opts.onProgress) || (() => {});
+  }
+  describe() { return "Chrome's built-in AI"; }
+  async session(messages) {
+    const LM = this.g.LanguageModel;
+    if (!LM) throw new LLMError("Chrome's built-in AI isn't available in this browser or on this computer.");
+    const {system, history, prompt} = splitMessages(messages);
+    const initialPrompts = (system ? [{role: "system", content: system}] : []).concat(history);
+    const onProgress = this.onProgress;
+    try {
+      const sess = await LM.create({
+        initialPrompts,
+        expectedInputs: [{type: "text", languages: ["en"]}], expectedOutputs: [{type: "text", languages: ["en"]}],
+        monitor(m) { m.addEventListener("downloadprogress", (e) => onProgress("Setting up Chrome's built-in AI (one-time download)", e.loaded)); },
+      });
+      return {sess, prompt};
+    } catch (e) {
+      throw new LLMError("Chrome's built-in AI couldn't start: " + ((e && e.message) || e));
+    }
+  }
+  async chat(messages) {
+    const {sess, prompt} = await this.session(messages);
+    try { return await sess.prompt(prompt); } catch (e) {
+      throw new LLMError("Chrome's built-in AI stopped: " + ((e && e.message) || e));
+    } finally { if (sess.destroy) sess.destroy(); }
+  }
+  async *stream(messages) {
+    const {sess, prompt} = await this.session(messages);
+    try {
+      for await (const chunk of sess.promptStreaming(prompt)) yield chunk;
+    } catch (e) {
+      throw new LLMError("Chrome's built-in AI stopped: " + ((e && e.message) || e));
+    } finally { if (sess.destroy) sess.destroy(); }
+  }
+}
+
+// A small open model downloaded once into the browser and run on the
+// computer's graphics chip (WebGPU). Private and free, but needs a download
+// of about 1 GB and a reasonably recent computer.
+export const WEBLLM_URL = "https://esm.run/@mlc-ai/web-llm@0.2.79";
+export const WEBLLM_MODELS = ["Qwen2.5-1.5B-Instruct-q4f16_1-MLC", "Llama-3.2-1B-Instruct-q4f16_1-MLC"];
+let webllmEngine = null, webllmModel = null;
+
+export async function webgpuSupported(g) {
+  g = g || globalThis;
+  try { return !!(g.navigator && g.navigator.gpu && await g.navigator.gpu.requestAdapter()); } catch (e) { return false; }
+}
+
+export async function webllmDownloaded(store) {
+  return !!(store && (store.get("meta", {}) || {}).webllm_ready);
+}
+
+export class WebLLMClient extends LLM {
+  constructor(settings, opts) {
+    super(Object.assign({}, settings, {provider: "webllm", label: PROVIDERS.webllm.label, url: "webllm"}), opts);
+    this.onProgress = (opts && opts.onProgress) || (() => {});
+    this.store = opts && opts.store;
+    this.importer = (opts && opts.importer) || ((url) => import(url));
+  }
+  describe() { return "private AI on this computer" + (webllmModel ? " (" + webllmModel.split("-q4")[0] + ")" : ""); }
+  async engine() {
+    if (webllmEngine) return webllmEngine;
+    if (!(await webgpuSupported())) throw new LLMError("This computer or browser can't run the private AI (it needs WebGPU, found in recent Chrome on most computers from about 2016 onwards).");
+    let lib;
+    try { lib = await this.importer(WEBLLM_URL); } catch (e) {
+      throw new LLMError("Couldn't load the private AI software. Check your internet connection and try again.");
+    }
+    let lastErr = null;
+    for (const model of WEBLLM_MODELS) {
+      try {
+        webllmEngine = await lib.CreateMLCEngine(model, {initProgressCallback: (p) =>
+          this.onProgress("Downloading the private AI (one time only): " + (p.text || ""), p.progress)});
+        webllmModel = model;
+        if (this.store) this.store.set("meta", Object.assign(this.store.get("meta", {}) || {}, {webllm_ready: model}));
+        return webllmEngine;
+      } catch (e) { lastErr = e; }
+    }
+    throw new LLMError("The private AI couldn't start on this computer: " + ((lastErr && lastErr.message) || lastErr));
+  }
+  async chat(messages, opts) {
+    opts = opts || {};
+    const eng = await this.engine();
+    const r = await eng.chat.completions.create({messages, temperature: opts.temperature ?? 0.7, max_tokens: opts.maxTokens || 700});
+    return ((r.choices || [])[0] || {}).message?.content || "";
+  }
+  async *stream(messages, opts) {
+    opts = opts || {};
+    const eng = await this.engine();
+    const chunks = await eng.chat.completions.create({messages, temperature: opts.temperature ?? 0.7, max_tokens: opts.maxTokens || 700, stream: true});
+    for await (const c of chunks) {
+      const t = c.choices && c.choices[0] && c.choices[0].delta && c.choices[0].delta.content;
+      if (t) yield t;
+    }
+  }
+}
+
+// "Automatic": tries the no-setup options best-first and falls back to the
+// next one if one isn't available or fails:
+//   1. Chrome's built-in AI, if this computer already has it (private, fast)
+//   2. the private downloaded AI, if it was downloaded before (private)
+//   3. the free shared AI (Pollinations), which works anywhere but is slow
+export class AutoLLM extends LLM {
+  constructor(settings, opts) {
+    super(Object.assign({}, settings, {provider: "auto", label: PROVIDERS.auto.label, url: "auto"}), opts);
+    this.opts = opts || {};
+    this.chosen = null;
+    this.candidates = this.opts.candidates || null;  // tests can pass their own list
+  }
+  describe() { return this.chosen ? this.chosen.describe() : "the best free option available"; }
+  async list() {
+    if (this.candidates) return this.candidates;
+    const out = [];
+    if ((await chromeAIStatus(this.opts.global)) === "available") out.push(new ChromeLLM({}, this.opts));
+    if (await webllmDownloaded(this.opts.store)) out.push(new WebLLMClient({}, this.opts));
+    out.push(new LLM(loadSettings(new Store(), "pollinations"), this.opts));
+    this.candidates = out;
+    return out;
+  }
+  async order() {
+    const all = await this.list();
+    return this.chosen ? [this.chosen].concat(all.filter((c) => c !== this.chosen)) : all;
+  }
+  async chat(messages, opts) {
+    let last = null;
+    for (const c of await this.order()) {
+      try { const t = await c.chat(messages, opts); this.chosen = c; return t; } catch (e) {
+        if (!(e instanceof LLMError)) throw e;
+        last = e;
+      }
+    }
+    throw last || new LLMError("No free AI option is working right now. Try again in a minute, or add your own free key in Settings.");
+  }
+  async *stream(messages, opts) {
+    let last = null;
+    for (const c of await this.order()) {
+      let started = false;
+      try {
+        for await (const chunk of c.stream(messages, opts)) { started = true; this.chosen = c; yield chunk; }
+        if (started) return;
+        this.chosen = c;
+        return;
+      } catch (e) {
+        if (started || !(e instanceof LLMError)) throw e;  // can't switch half way through an answer
+        last = e;
+      }
+    }
+    throw last || new LLMError("No free AI option is working right now.");
+  }
+  async check() {
+    const reply = await this.chat([{role: "user", content: "Reply with the word OK."}], {temperature: 0, maxTokens: 20});
+    return "Working: using " + this.describe() + ". It replied: " + (reply.trim().slice(0, 40) || "(empty)");
+  }
+}
+
+// One place that turns settings into the right kind of AI client.
+export function makeLLM(settings, opts) {
+  const kind = (PROVIDERS[settings.provider] || {}).kind;
+  if (kind === "auto") return new AutoLLM(settings, opts);
+  if (kind === "chrome") return new ChromeLLM(settings, opts);
+  if (kind === "webllm") return new WebLLMClient(settings, opts);
+  return new LLM(settings, opts);
 }
 
 // Returns text, "" for nothing, or null for the end of the stream.
@@ -350,7 +681,7 @@ function firstBalanced(text) {
 // ----------------------------------------------------------- model picker ---
 
 const NOT_CHAT = ["whisper", "tts", "embed", "imagen", "veo", "aqa", "guard", "orpheus",
-  "moderation", "dall-e", "image-generation", "native-audio", "learnlm"];
+  "moderation", "dall-e", "image", "native-audio", "audio", "live", "learnlm", "computer-use", "robotics", "lyria"];
 
 export function modelsUrl(chatUrl) {
   let u = (chatUrl || "").trim().replace(/\/+$/, "");
@@ -375,6 +706,8 @@ export function parseModels(data, provider) {
     if (id.startsWith("models/")) id = id.slice(7);
     const low = id.toLowerCase();
     if (!id || seen.has(id) || NOT_CHAT.some((w) => low.includes(w))) continue;
+    // Gemma models on Gemini's API reject the instructions this app sends.
+    if (provider === "gemini" && low.startsWith("gemma")) continue;
     seen.add(id);
     out.push({id, free: isFree(it)});
   }
@@ -395,11 +728,17 @@ export async function listModels(settings, fetchFn) {
   const headers = {};
   if (settings.apiKey) headers.Authorization = "Bearer " + settings.apiKey;
   let r;
-  try { r = await fetchFn(modelsUrl(settings.url), {headers}); } catch (e) {
-    throw new LLMError("Couldn't load the model list. Check your internet connection, or type a model name.");
+  const ctl = typeof AbortController !== "undefined" ? new AbortController() : null;
+  const timer = setTimeout(() => ctl && ctl.abort(), 15000);
+  try { r = await fetchFn(modelsUrl(settings.url), {headers, signal: ctl ? ctl.signal : undefined}); } catch (e) {
+    throw new LLMError("Couldn't load the model list (no answer from the service). The suggested model usually works.");
+  } finally { clearTimeout(timer); }
+  if (!r.ok) {
+    const msg = errorMessage(await r.text().catch(() => ""));
+    if (r.status === 401 || r.status === 403 || (r.status === 400 && /api.?key/i.test(msg)))
+      throw new LLMError("The key was rejected. Copy it again from the provider's website and paste it here." + (msg ? " (It said: " + msg + ")" : ""));
+    throw new LLMError("Couldn't load the model list (HTTP " + r.status + (msg ? ": " + msg : "") + ").");
   }
-  if (r.status === 401 || r.status === 403) throw new LLMError("The key was rejected (HTTP " + r.status + "). Check it and try again.");
-  if (!r.ok) throw new LLMError("Couldn't load the model list (HTTP " + r.status + "). You can type a model name instead.");
   let data;
   try { data = await r.json(); } catch (e) { throw new LLMError("The provider's model list was in an unexpected format."); }
   const models = parseModels(data, settings.provider);
@@ -444,10 +783,11 @@ export function trim(text, limit) {
 }
 
 export const prompts = {
-  question(topicName, subtopic, difficulty, avoid, context) {
+  question(topicName, subtopic, difficulty, avoid, context, contextKind) {
     const parts = ["Write ONE multiple-choice quiz question.", "Topic: " + topicName, "Focus: " + subtopic,
       "Difficulty " + difficulty + "/5 (" + (DIFFICULTY_LABELS[difficulty] || "") + ")."];
-    if (context) parts.push('Base the question on this assignment brief:\n"""\n' + trim(context, 2500) + '\n"""');
+    if (context) parts.push((contextKind === "notes" ? "Use these notes about the student's course as a guide:" : "Base the question on this assignment brief:") +
+      '\n"""\n' + trim(context, 2500) + '\n"""');
     if (avoid && avoid.length) parts.push("Do NOT repeat these existing questions:\n- " + avoid.map((a) => a.slice(0, 120)).join("\n- "));
     parts.push("Rules: exactly 4 choices, exactly one correct, wrong choices must be plausible, no 'all of the above'. " +
       "answer_index is 0-3. Explanation is 1-3 sentences and says why the answer is right.",
@@ -689,10 +1029,32 @@ export class Progress {
 
 const slug = (t) => (t.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40).replace(/-+$/, "") || "assignment");
 
+export const GENERAL_MODULE = "general";
+
+// Every assignment lives in exactly one module's folder. Assignments made
+// before modules existed (or whose module was deleted) go into "General".
 export class Assignments {
   constructor(store) { this.store = store; }
-  all() { return this.store.get("assignments", {}) || {}; }
-  list() { return Object.values(this.all()).sort((a, b) => a.id.localeCompare(b.id)); }
+  all() {
+    const all = this.store.get("assignments", {}) || {};
+    const mods = new Modules(this.store);
+    let changed = false;
+    for (const a of Object.values(all)) {
+      if (!a.module || !mods.has(a.module)) { a.module = ensureGeneralModule(this.store); changed = true; }
+    }
+    if (changed) this.store.set("assignments", all);
+    return all;
+  }
+  list(module) {
+    return Object.values(this.all()).filter((a) => !module || a.module === module).sort((a, b) => a.title.localeCompare(b.title));
+  }
+  move(id, module) {
+    if (!new Modules(this.store).has(module)) throw new Error("That module no longer exists.");
+    const a = this.get(id);
+    a.module = module;
+    this.save(a);
+    return a;
+  }
   get(id) { const a = this.all()[id]; if (!a) throw new Error("That assignment no longer exists."); return a; }
   save(a) { const all = this.all(); a.updated_at = nowIso(); all[a.id] = a; this.store.set("assignments", all); }
   add(f) {
@@ -702,7 +1064,8 @@ export class Assignments {
     while (all[id]) id = base + "-" + n++;
     const a = {id, title: f.title.trim(), course: (f.course || "").trim(), due: (f.due || "").trim(),
       brief_text: f.brief.trim(), rubric_text: (f.rubric || "").trim(), concepts: [], outline: "", drafts: [],
-      working_draft: "", notes: "", lessons: {}, hints: [], created_at: nowIso()};
+      working_draft: "", notes: "", lessons: {}, hints: [], created_at: nowIso(),
+      module: new Modules(this.store).has(f.module) ? f.module : ensureGeneralModule(this.store)};
     this.save(a);
     return a;
   }
@@ -752,18 +1115,171 @@ export function assignmentMarkdown(a) {
 
 // ----------------------------------------------------------------- topics ---
 
+// ---------------------------------------------------------------- modules ---
+// A module is a class subject you study (MIDI, Music composition, ...). Each
+// one has its own question bank, progress, spaced review and notes. Modules
+// live in this browser's storage; the first time the app runs it creates the
+// built-in ones plus some starter modules, all of which you can edit or delete.
+
+export const STARTER_MODULES = {
+  "music-business": {
+    name: "Music business and marketing",
+    description: "How the music industry works and how artists earn, promote and protect their music.",
+    subtopics: ["copyright, publishing and ownership", "royalties and collecting societies", "record deals and contracts",
+      "streaming, distribution and release planning", "music marketing and social media", "branding and building an audience",
+      "live music business and touring", "music industry careers, networking and freelancing"],
+  },
+  "creative-labs": {
+    name: "Creative project labs",
+    description: "Planning, making and reflecting on creative music projects.",
+    subtopics: ["reading a brief and planning a project", "creative research and reference tracks", "collaboration and teamwork",
+      "production workflow and file management", "critical listening and giving feedback", "reflective practice and evaluation",
+      "presenting and pitching your work", "time management and meeting deadlines"],
+  },
+  "composition": {
+    name: "Music composition",
+    description: "Writing and developing musical ideas, from melody and harmony to form and arranging.",
+    subtopics: ["melody writing", "harmony and chord progressions", "rhythm and groove", "song structure and form",
+      "motifs and thematic development", "arranging and orchestration", "counterpoint and voice leading", "composing for film, games and media"],
+  },
+};
+
+function seedModules(store) {
+  const mods = {};
+  for (const [k, t] of Object.entries(TOPICS)) mods[k] = {key: k, name: t.name, description: "", notes: "", my_notes: "", subtopics: t.subtopics.slice(), created_at: nowIso()};
+  mods.live.name = "Live sound practices (PA setup, mic placement, gain staging, feedback)";
+  for (const [k, t] of Object.entries(STARTER_MODULES)) mods[k] = Object.assign({key: k, notes: "", my_notes: "", created_at: nowIso()}, JSON.parse(JSON.stringify(t)));
+  // Anything already studied under a name we don't know becomes a module, so no work is lost.
+  for (const k of store.keys("questions:").concat(store.keys("progress:"))) {
+    if (!mods[k] && !k.startsWith(ASSIGNMENT_PREFIX) && SAFE_KEY.test(k))
+      mods[k] = {key: k, name: k.replace(/-/g, " "), description: "", notes: "", my_notes: "", subtopics: ["general"], created_at: nowIso()};
+  }
+  return mods;
+}
+
+export class Modules {
+  constructor(store) { this.store = store; }
+  all() {
+    let mods = this.store.get("modules", null);
+    if (!mods || typeof mods !== "object") {
+      mods = seedModules(this.store);
+      this.store.set("modules", mods);
+    }
+    return mods;
+  }
+  list() { return Object.values(this.all()).sort((a, b) => a.name.localeCompare(b.name)); }
+  has(key) { return !!this.all()[key]; }
+  get(key) { const m = this.all()[key]; if (!m) throw new Error("That module no longer exists."); return m; }
+  save(m) { const all = this.all(); m.updated_at = nowIso(); all[m.key] = m; this.store.set("modules", all); }
+  add(f) {
+    const name = (f.name || "").trim();
+    if (!name) throw new Error("Give the module a name.");
+    const all = this.all();
+    if (Object.values(all).some((m) => m.name.toLowerCase() === name.toLowerCase())) throw new Error("You already have a module called that.");
+    let base = slug(name);
+    if (base.startsWith(ASSIGNMENT_PREFIX)) base = "m-" + base;
+    let key = base, n = 2;
+    while (all[key] || this.store.get("questions:" + key, null) || this.store.get("progress:" + key, null)) key = base + "-" + n++;
+    const m = {key, name: name.slice(0, 120), description: (f.description || "").trim().slice(0, 500), notes: (f.notes || "").trim(),
+      my_notes: "", subtopics: cleanSubtopics(f.subtopics), created_at: nowIso()};
+    this.save(m);
+    return m;
+  }
+  update(key, f) {
+    const m = this.get(key);
+    if (f.name !== undefined) {
+      const name = String(f.name).trim();
+      if (!name) throw new Error("Give the module a name.");
+      if (this.list().some((x) => x.key !== key && x.name.toLowerCase() === name.toLowerCase())) throw new Error("You already have a module called that.");
+      m.name = name.slice(0, 120);
+    }
+    if (f.description !== undefined) m.description = String(f.description).trim().slice(0, 500);
+    if (f.notes !== undefined) m.notes = String(f.notes).trim();
+    if (f.my_notes !== undefined) m.my_notes = String(f.my_notes);
+    if (f.subtopics !== undefined) m.subtopics = cleanSubtopics(f.subtopics);
+    this.save(m);
+    return m;
+  }
+  // Deletes the module with its questions and progress. Its assignments are
+  // never deleted with it: they move to the "General" folder.
+  remove(key) {
+    const all = this.all();
+    delete all[key];
+    this.store.set("modules", all);
+    this.store.remove("questions:" + key);
+    this.store.remove("progress:" + key);
+    const asg = this.store.get("assignments", {}) || {};
+    const moved = Object.values(asg).filter((a) => a.module === key);
+    if (moved.length) {
+      const general = key === GENERAL_MODULE ? null : ensureGeneralModule(this.store);
+      if (!general) {  // deleting General itself while it holds work: recreate it
+        const a2 = this.all(); a2[GENERAL_MODULE] = {key: GENERAL_MODULE, name: "General", description: "", notes: "", my_notes: "",
+          subtopics: ["study skills and key ideas"], created_at: nowIso()}; this.store.set("modules", a2);
+      }
+      for (const a of moved) a.module = GENERAL_MODULE;
+      this.store.set("assignments", asg);
+    }
+    return moved.length;
+  }
+}
+
+export function ensureGeneralModule(store) {
+  const mods = new Modules(store);
+  if (!mods.has(GENERAL_MODULE)) {
+    const all = mods.all();
+    all[GENERAL_MODULE] = {key: GENERAL_MODULE, name: "General", description: "Assignments that aren't in a specific module yet.",
+      notes: "", my_notes: "", subtopics: ["study skills and key ideas"], created_at: nowIso()};
+    store.set("modules", all);
+  }
+  return GENERAL_MODULE;
+}
+
+export function cleanSubtopics(v) {
+  const list = (Array.isArray(v) ? v : String(v || "").split(/\n|;/)).map((x) => String(x).replace(/^\s*[-*•\d.)]+\s*/, "").trim())
+    .filter(Boolean).map((x) => x.slice(0, 120));
+  const uniq = Array.from(new Set(list)).slice(0, 12);
+  return uniq.length ? uniq : [];
+}
+
+const SUBTOPICS_SCHEMA = {type: "object", properties: {subtopics: {type: "array", items: {type: "string"}, minItems: 4, maxItems: 10}}, required: ["subtopics"]};
+export function validateSubtopics(obj) {
+  const items = obj && !Array.isArray(obj) ? obj.subtopics : obj;
+  if (!Array.isArray(items)) throw new Error("expected a list of subtopics");
+  const out = cleanSubtopics(items.map((x) => (x && typeof x === "object" ? x.name : x)));
+  if (out.length < 3) throw new Error("need at least 3 subtopics");
+  return out.slice(0, 10);
+}
+
+// Asks the AI to split a new module into 6-8 study areas, guided by its notes.
+export async function suggestSubtopics(llm, m) {
+  const parts = ["A college music technology student is studying the module \"" + m.name + "\"."];
+  if (m.description) parts.push("Description: " + m.description);
+  if (m.notes) parts.push('Course notes or syllabus:\n"""\n' + trim(m.notes, 3000) + '\n"""');
+  parts.push("List 6-8 subtopics to quiz them on, each a short phrase, covering the module evenly. " +
+    'Reply ONLY with JSON like: {"subtopics": ["copyright basics", "royalties"]}');
+  return llm.chatJson([{role: "system", content: "You plan college courses. You reply only with JSON."}, {role: "user", content: parts.join("\n")}],
+    SUBTOPICS_SCHEMA, validateSubtopics, {temperature: 0.3, maxTokens: 400});
+}
+
 export function topicInfo(store, key) {
-  if (TOPICS[key]) return {key, name: TOPICS[key].name, subtopics: TOPICS[key].subtopics.slice(), context: null};
   if (key.startsWith(ASSIGNMENT_PREFIX)) {
     const a = new Assignments(store).get(key.slice(ASSIGNMENT_PREFIX.length));
     const subs = (a.concepts || []).map((c) => c.name);
-    return {key, name: "Assignment: " + a.title, subtopics: subs.length ? subs : ["key ideas in the brief"], context: a.brief_text};
+    return {key, name: "Assignment: " + a.title, subtopics: subs.length ? subs : ["key ideas in the brief"], context: a.brief_text, contextKind: "brief"};
+  }
+  const mods = new Modules(store);
+  if (mods.has(key)) {
+    const m = mods.get(key);
+    const context = [m.description, m.notes].filter(Boolean).join("\n\n");
+    return {key, name: m.name, subtopics: m.subtopics && m.subtopics.length ? m.subtopics.slice() : ["key ideas of " + m.name],
+      context: context || null, contextKind: "notes"};
   }
   throw new Error("Unknown topic " + key);
 }
 
 export function allTopicKeys(store) {
-  return Object.keys(TOPICS).concat(new Assignments(store).list().map((a) => ASSIGNMENT_PREFIX + a.id));
+  const asg = new Assignments(store).list();  // first, so old assignments are filed into General before modules are listed
+  return new Modules(store).list().map((m) => m.key).concat(asg.map((a) => ASSIGNMENT_PREFIX + a.id));
 }
 
 // -------------------------------------------------------------- generator ---
@@ -774,7 +1290,7 @@ export function planDifficulties(n, centre) {
 }
 
 export async function generateOne(llm, bank, info, subtopic, difficulty, source) {
-  const cleaned = await llm.chatJson(prompts.question(info.name, subtopic, difficulty, bank.recentTexts(subtopic, 6), info.context),
+  const cleaned = await llm.chatJson(prompts.question(info.name, subtopic, difficulty, bank.recentTexts(subtopic, 6), info.context, info.contextKind),
     QUESTION_SCHEMA, validateQuestion, {temperature: 0.6, maxTokens: 500});
   return bank.add(cleaned, subtopic, difficulty, source);
 }
@@ -909,6 +1425,70 @@ export function stats(store, today) {
     dueTotal: due.reduce((a, r) => a + r.due, 0), due};
 }
 
+// ----------------------------------------------------- folder downloads ---
+// A .zip with one folder per module, each holding its own notes and its own
+// assignments, so the downloaded files are organised the same way as the app.
+
+const CRC_TABLE = (() => {
+  const t = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1; t[n] = c >>> 0; }
+  return t;
+})();
+function crc32(bytes) {
+  let c = 0xFFFFFFFF;
+  for (let i = 0; i < bytes.length; i++) c = CRC_TABLE[(c ^ bytes[i]) & 0xFF] ^ (c >>> 8);
+  return (c ^ 0xFFFFFFFF) >>> 0;
+}
+// Minimal "stored" (uncompressed) zip writer: [{path, text}] -> Uint8Array.
+export function makeZip(files) {
+  const enc = new TextEncoder(), parts = [], central = [];
+  let offset = 0;
+  const u16 = (v) => [v & 0xFF, (v >>> 8) & 0xFF];
+  const u32 = (v) => [v & 0xFF, (v >>> 8) & 0xFF, (v >>> 16) & 0xFF, (v >>> 24) & 0xFF];
+  for (const f of files) {
+    const name = enc.encode(f.path), data = enc.encode(f.text), crc = crc32(data);
+    const common = [...u16(20), ...u16(0x0800), ...u16(0), ...u16(0), ...u16(0x21), ...u32(crc), ...u32(data.length), ...u32(data.length), ...u16(name.length), ...u16(0)];
+    const local = new Uint8Array([...u32(0x04034b50), ...common]);
+    parts.push(local, name, data);
+    central.push(new Uint8Array([...u32(0x02014b50), ...u16(20), ...common, ...u16(0), ...u16(0), ...u16(0), ...u32(0), ...u32(offset)]), name);
+    offset += local.length + name.length + data.length;
+  }
+  const cdSize = central.reduce((n, p) => n + p.length, 0);
+  const end = new Uint8Array([...u32(0x06054b50), ...u16(0), ...u16(0), ...u16(files.length), ...u16(files.length), ...u32(cdSize), ...u32(offset), ...u16(0)]);
+  const all = parts.concat(central, [end]), out = new Uint8Array(all.reduce((n, p) => n + p.length, 0));
+  let pos = 0;
+  for (const p of all) { out.set(p, pos); pos += p.length; }
+  return out;
+}
+
+export function safeName(s) {
+  return String(s || "untitled").replace(/[\\/:*?"<>|\x00-\x1f]+/g, "-").replace(/\s+/g, " ").trim().slice(0, 60) || "untitled";
+}
+
+export function moduleText(m) {
+  const out = ["# " + m.name, ""];
+  if (m.description) out.push(m.description, "");
+  out.push("## Subtopics", "", ...(m.subtopics || []).map((x) => "- " + x), "");
+  if (m.notes) out.push("## Course notes", "", m.notes, "");
+  if (m.my_notes) out.push("## My notes", "", m.my_notes, "");
+  return out.join("\n");
+}
+
+// Files for one module (or every module), laid out as folders.
+export function moduleFiles(store, onlyKey) {
+  const files = [], used = new Set();
+  const mods = new Modules(store), asg = new Assignments(store);
+  for (const m of mods.list()) {
+    if (onlyKey && m.key !== onlyKey) continue;
+    let folder = safeName(m.name.replace(/\s*\(.*\)\s*$/, ""));
+    while (used.has(folder)) folder += " (" + m.key + ")";
+    used.add(folder);
+    files.push({path: folder + "/About this module.txt", text: moduleText(m)});
+    for (const a of asg.list(m.key)) files.push({path: folder + "/Assignments/" + safeName(a.title) + ".txt", text: assignmentMarkdown(a)});
+  }
+  return files;
+}
+
 // ---------------------------------------------------------- backup/restore ---
 // The same file format as `python main.py backup`. Your API key is never included.
 
@@ -917,6 +1497,7 @@ export function exportBackup(store) {
   for (const k of store.keys("questions:")) out.questions[k] = store.get("questions:" + k, []);
   for (const k of store.keys("progress:")) out.progress[k] = store.get("progress:" + k, {});
   out.assignments = store.get("assignments", {}) || {};
+  out.modules = new Modules(store).all();
   return out;
 }
 
@@ -952,10 +1533,29 @@ export function importBackup(store, data) {
     all[id] = a; counts.assignments++;
   }
   store.set("assignments", all);
+  // Modules: add or update the ones in the file; make sure every imported bank has a module.
+  const mods = new Modules(store), have = mods.all();
+  counts.modules = 0;
+  for (const [k, m] of Object.entries(data.modules || {})) {
+    if (!SAFE_KEY.test(k) || k.startsWith(ASSIGNMENT_PREFIX) || !m || typeof m !== "object" || !String(m.name || "").trim()) continue;
+    have[k] = {key: k, name: String(m.name).trim().slice(0, 120), description: String(m.description || "").slice(0, 500),
+      notes: String(m.notes || ""), my_notes: String(m.my_notes || ""), subtopics: cleanSubtopics(m.subtopics || []),
+      created_at: m.created_at || nowIso()};
+    counts.modules++;
+  }
+  // Banks, and assignment folders from the terminal version, that have no module yet get one.
+  const asgModules = Object.values(data.assignments || {}).map((a) => (a && typeof a.module === "string" ? a.module : "")).filter(Boolean);
+  for (const k of Object.keys(data.questions || {}).concat(Object.keys(data.progress || {}), asgModules)) {
+    if (SAFE_KEY.test(k) && !k.startsWith(ASSIGNMENT_PREFIX) && !have[k])
+      have[k] = {key: k, name: k === GENERAL_MODULE ? "General" : TOPICS[k] ? TOPICS[k].name : k.replace(/-/g, " "), description: "", notes: "", my_notes: "",
+        subtopics: TOPICS[k] ? TOPICS[k].subtopics.slice() : ["general"], created_at: nowIso()};
+  }
+  store.set("modules", have);
   store.set("meta", Object.assign(store.get("meta", {}) || {}, {last_import: nowIso()}));
   return counts;
 }
 
 export function hasAnyWork(store) {
+  // (modules alone don't count: everyone starts with some)
   return store.keys("progress:").length > 0 || store.keys("questions:").length > 0 || new Assignments(store).list().length > 0;
 }

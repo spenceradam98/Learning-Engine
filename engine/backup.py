@@ -12,6 +12,8 @@ from pathlib import Path
 from typing import Dict, Optional
 
 from . import config
+from . import topics
+from .assignments import GENERAL, AssignmentStore
 from .storage import now, read_json, write_json
 
 KEEP_AUTO_BACKUPS = 10
@@ -27,11 +29,12 @@ def export_backup() -> dict:
                 data = read_json(p, None)
                 if data is not None:
                     out[field][p.stem] = data
-    if config.ASSIGNMENTS_DIR.exists():
-        for p in sorted(config.ASSIGNMENTS_DIR.glob("*.json")):
-            a = read_json(p, None)
-            if isinstance(a, dict) and a.get("id") == p.stem:
-                out["assignments"][p.stem] = a
+    # One folder per module; each assignment records which folder it's in.
+    for a in AssignmentStore().list():
+        out["assignments"][a["id"]] = a
+    mods = topics.saved_modules()
+    if mods:
+        out["modules"] = mods
     return out
 
 
@@ -96,8 +99,19 @@ def restore_backup(path: Path) -> Dict[str, int]:
         if len(prog["history"]) >= len(mine.get("history", [])):
             write_json(p, prog)
             counts["topics"] += 1
+    store = AssignmentStore()
     for aid, a in (data.get("assignments") or {}).items():
         if _SAFE.match(aid) and isinstance(a, dict) and a.get("id") == aid and a.get("title"):
-            write_json(config.ASSIGNMENTS_DIR / "{}.json".format(aid), a)
+            mod = a.get("module")
+            a["module"] = mod if isinstance(mod, str) and _SAFE.match(mod) and not mod.startswith("assignment-") else GENERAL
+            store.save(a)  # goes into data/assignments/<module>/
             counts["assignments"] += 1
+    # Modules made in the browser (name, subtopics, notes) so the terminal can quiz them too.
+    mods = {k: m for k, m in (data.get("modules") or {}).items()
+            if _SAFE.match(k) and not k.startswith("assignment-") and isinstance(m, dict) and str(m.get("name") or "").strip()}
+    if mods:
+        merged = topics.saved_modules()
+        merged.update(mods)
+        write_json(topics.modules_file(), merged)
+        counts["modules"] = len(mods)
     return counts

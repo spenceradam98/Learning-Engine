@@ -4,9 +4,29 @@ import * as E from "./engine.js";
 const $ = (id) => document.getElementById(id);
 const LETTERS = "ABCD";
 const store = new E.Store(window.localStorage);
-let SETTINGS = E.loadSettings(store), QUIZ = null, ASSIGN = null, LESSON = null, MODELS = null;
-const assignments = new E.Assignments(store);
-const llm = () => new E.LLM(SETTINGS);
+let SETTINGS = E.loadSettings(store), QUIZ = null, ASSIGN = null, LESSON = null, MODELS = null, MOD = null;
+const assignments = new E.Assignments(store), modules = new E.Modules(store);
+// Shows "busy, trying again" while the AI client retries, so nothing looks frozen.
+function onRetry(n, total, wait) {
+  const b = $("busy-note");
+  if (!n) { b.classList.add("hidden"); return; }
+  b.textContent = "The AI is busy or asked us to wait. Trying again" + (wait ? " in " + Math.round(wait) + " seconds" : "") +
+    " (" + n + " of " + total + ")...";
+  b.classList.remove("hidden");
+}
+function onProgress(text, frac) {
+  const b = $("busy-note");
+  if (frac != null && frac >= 1) { b.classList.add("hidden"); return; }
+  b.textContent = text + (frac != null ? " " + Math.round(frac * 100) + "%" : "");
+  b.classList.remove("hidden");
+}
+// One AI client for the whole page, so Automatic remembers which option worked.
+let LLM_CACHE = null, LLM_FOR = "";
+function llm() {
+  const sig = JSON.stringify(SETTINGS);
+  if (!LLM_CACHE || LLM_FOR !== sig) { LLM_CACHE = E.makeLLM(SETTINGS, {onRetry, onProgress, store}); LLM_FOR = sig; }
+  return LLM_CACHE;
+}
 
 // ---------------------------------------------------------------- helpers ---
 function esc(s) {
@@ -89,13 +109,14 @@ function showTab(name) {
   if (name === "quiz") { loadToday(); loadTopics(); }
   if (name === "review") loadReview();
   if (name === "generate") loadTopics();
-  if (name === "assign") loadAssignments();
+  if (name === "assign") loadModules();
   if (name === "settings") fillSettings();
 }
 $("nav").addEventListener("click", (e) => { if (e.target.dataset.tab) showTab(e.target.dataset.tab); });
 
 function showStatus() {
-  $("ai").textContent = E.isConfigured(SETTINGS) ? "AI: " + (SETTINGS.provider === "local" ? "local model" : SETTINGS.model) : "AI: not set up yet";
+  $("ai").textContent = !E.isConfigured(SETTINGS) ? "AI: not set up yet" : SETTINGS.keyless ? "AI: " + SETTINGS.label
+    : "AI: " + (SETTINGS.provider === "local" ? "local model" : SETTINGS.model);
 }
 
 // --------------------------------------------------------- today & topics ---
@@ -119,9 +140,11 @@ function topicRows() {
 }
 function loadTopics() {
   const rows = topicRows();
+  const opts = (list) => list.map((t) => '<option value="' + esc(t.key) + '">' + esc(t.name) + "</option>").join("");
+  const mods = rows.filter((t) => !t.key.startsWith(E.ASSIGNMENT_PREFIX)), asg = rows.filter((t) => t.key.startsWith(E.ASSIGNMENT_PREFIX));
   for (const sel of [$("quiz-topic"), $("gen-topic")]) {
     const keep = sel.value;
-    sel.innerHTML = rows.map((t) => '<option value="' + esc(t.key) + '">' + esc(t.name) + "</option>").join("");
+    sel.innerHTML = '<optgroup label="Modules">' + opts(mods) + "</optgroup>" + (asg.length ? '<optgroup label="Assignments">' + opts(asg) + "</optgroup>" : "");
     if (keep && rows.some((t) => t.key === keep)) sel.value = keep;
   }
   $("topics-table").innerHTML = "<table><tr><th>Topic</th><th>Questions</th><th>Level</th><th>Answered</th><th>Accuracy</th></tr>" +
@@ -279,23 +302,156 @@ function loadReview() {
   });
 }
 
-// ------------------------------------------------------------ assignments ---
-function loadAssignments() {
+// ---------------------------------------------------------------- modules ---
+// Each module is a folder: its own questions, progress, notes and assignments.
+function loadModules() {
+  flushModNotes();
+  MOD = null;
   $("assign-detail").classList.add("hidden");
-  $("assign-list-view").classList.remove("hidden");
-  const list = assignments.list();
+  $("mod-view").classList.add("hidden");
+  $("mod-list-view").classList.remove("hidden");
+  const today = E.todayStr();
+  $("mod-list").innerHTML = modules.list().map((m) => {
+    const n = assignments.list(m.key).length, bank = new E.QuestionBank(store, m.key).length, p = new E.Progress(store, m.key);
+    const due = p.dueIds(today).length, t = p.totals();
+    const bits = [n + (n === 1 ? " assignment" : " assignments"), bank + " questions"];
+    if (t.answered) bits.push(Math.round(t.accuracy * 100) + "% correct");
+    if (due) bits.push(due + " due");
+    return '<button class="folder" data-mod="' + esc(m.key) + '"><b>' + esc(m.name) + '</b><span class="muted">' + esc(bits.join(" · ")) + "</span>" +
+      (m.description ? '<span class="muted">' + esc(m.description) + "</span>" : "") + "</button>";
+  }).join("") || '<p class="muted">No modules yet. Add one for each class subject.</p>';
+}
+$("mod-list").addEventListener("click", (e) => { const f = e.target.closest("[data-mod]"); if (f) openModule(f.dataset.mod); });
+$("mod-new").onclick = () => { $("mod-form").classList.remove("hidden"); $("mf-msg").innerHTML = ""; $("mf-name").focus(); };
+$("mf-cancel").onclick = () => $("mod-form").classList.add("hidden");
+$("mf-save").onclick = async () => {
+  const btn = $("mf-save"), msg = $("mf-msg");
+  let m;
+  try {
+    m = modules.add({name: $("mf-name").value, description: $("mf-desc").value, notes: $("mf-notes").value, subtopics: $("mf-subs").value});
+  } catch (e) { note(msg, "bad", e.message); return; }
+  if (!m.subtopics.length) {
+    busy(btn, true);
+    msg.innerHTML = '<p class="thinking">Asking the AI to suggest subtopics</p>';
+    let subs = null;
+    try { if (E.isConfigured(SETTINGS)) subs = await E.suggestSubtopics(llm(), m); } catch (e) { console.warn(e); }
+    onRetry(0);
+    modules.update(m.key, {subtopics: subs || ["key ideas of " + m.name, "terms and definitions", "practical skills"]});
+    busy(btn, false);
+  }
+  ["mf-name", "mf-desc", "mf-notes", "mf-subs"].forEach((id) => ($(id).value = ""));
+  msg.innerHTML = "";
+  $("mod-form").classList.add("hidden");
+  loadTopics();
+  openModule(m.key);
+};
+
+function openModule(key) {
+  flushModNotes();
+  const m = modules.get(key);
+  MOD = key;
+  $("mod-list-view").classList.add("hidden");
+  $("assign-detail").classList.add("hidden");
+  $("mod-view").classList.remove("hidden");
+  $("me-form").classList.add("hidden");
+  $("assign-form").classList.add("hidden");
+  $("mv-msg").innerHTML = "";
+  $("mv-title").textContent = m.name;
+  $("mv-desc").textContent = m.description || "";
+  const p = new E.Progress(store, key), t = p.totals(), due = p.dueIds().length;
+  $("mv-stats").textContent = new E.QuestionBank(store, key).length + " questions saved · level " + t.difficulty + "/5" +
+    (t.answered ? " · " + Math.round(t.accuracy * 100) + "% correct" : "") + (due ? " · " + due + " due for review" : "") +
+    " · subtopics: " + (m.subtopics || []).join(", ");
+  $("mv-review").classList.toggle("hidden", !due);
+  $("mv-notes").value = m.my_notes || "";
+  $("mv-notes-saved").textContent = m.my_notes ? "saved" : "";
+  $("af-mod").textContent = m.name;
+  const list = assignments.list(key);
   $("assign-list").innerHTML = list.length ? list.map((a) =>
     '<div class="list-item"><div><b>' + esc(a.title) + '</b><div class="muted">' + esc([a.course, a.due ? "due " + a.due : ""].filter(Boolean).join(" · ")) +
     '</div></div><button class="btn secondary" data-open="' + esc(a.id) + '">Open</button></div>').join("")
-    : '<p class="muted">No assignments yet. Add one and paste in the brief.</p>';
+    : '<p class="muted">No assignments in this module yet. Add one and paste in the brief.</p>';
 }
+$("mv-back").onclick = () => loadModules();
+$("mv-quiz").onclick = () => startQuiz(MOD);
+$("mv-review").onclick = () => startQuiz(MOD, "review");
+$("mv-gen").onclick = () => { const k = MOD; showTab("generate"); $("gen-topic").value = k; };
+$("mv-zip").onclick = safe(() => {
+  flushModNotes();
+  const m = modules.get(MOD);
+  download(E.safeName(m.name) + ".zip", E.makeZip(E.moduleFiles(store, MOD)), "application/zip");
+});
+$("mv-edit").onclick = () => {
+  const m = modules.get(MOD);
+  $("me-name").value = m.name; $("me-desc").value = m.description || ""; $("me-notes").value = m.notes || "";
+  $("me-subs").value = (m.subtopics || []).join("\n");
+  $("me-msg").innerHTML = "";
+  $("me-form").classList.remove("hidden");
+  $("me-name").focus();
+};
+$("me-cancel").onclick = () => $("me-form").classList.add("hidden");
+$("me-save").onclick = () => {
+  try {
+    const subs = E.cleanSubtopics($("me-subs").value);
+    if (!subs.length) throw new Error("Add at least one subtopic, one per line.");
+    modules.update(MOD, {name: $("me-name").value, description: $("me-desc").value, notes: $("me-notes").value, subtopics: subs});
+    loadTopics();
+    openModule(MOD);
+    note($("mv-msg"), "good", "Module saved.");
+  } catch (e) { note($("me-msg"), "bad", e.message); }
+};
+$("me-suggest").onclick = async () => {
+  if (needAI()) return;
+  const btn = $("me-suggest");
+  busy(btn, true);
+  thinking($("me-msg"));
+  try {
+    const subs = await E.suggestSubtopics(llm(), {name: $("me-name").value || modules.get(MOD).name, description: $("me-desc").value, notes: $("me-notes").value});
+    $("me-subs").value = subs.join("\n");
+    note($("me-msg"), "good", "Here are some suggestions. Change them if you like, then click Save changes.");
+  } catch (e) { note($("me-msg"), "bad", e.message); }
+  onRetry(0);
+  busy(btn, false);
+};
+$("me-delete").onclick = () => {
+  const m = modules.get(MOD), n = assignments.list(MOD).length;
+  if (!confirm('Delete the module "' + m.name + '" and its questions and progress from this browser?' +
+    (n ? " Its " + n + " assignment" + (n === 1 ? "" : "s") + " will be kept in the General folder." : ""))) return;
+  modules.remove(MOD);
+  MOD = null;
+  loadTopics();
+  loadModules();
+};
+// "My notes" for a module, autosaved like assignment notes.
+const flushModNotes = (() => {
+  let timer = null, key = null;
+  const flush = () => {
+    if (timer === null) return;
+    clearTimeout(timer); timer = null;
+    try {
+      if (key && modules.has(key)) modules.update(key, {my_notes: $("mv-notes").value});
+      $("mv-notes-saved").textContent = "saved " + new Date().toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"});
+    } catch (e) { $("mv-notes-saved").textContent = e.message; }
+  };
+  $("mv-notes").addEventListener("input", () => {
+    key = MOD;
+    $("mv-notes-saved").textContent = "saving...";
+    clearTimeout(timer);
+    timer = setTimeout(flush, 700);
+  });
+  $("mv-notes").addEventListener("blur", flush);
+  window.addEventListener("pagehide", flush);
+  return flush;
+})();
+
+// ------------------------------------------------------------ assignments ---
 $("assign-list").addEventListener("click", (e) => { if (e.target.dataset.open) openAssignment(e.target.dataset.open); });
-$("assign-new").onclick = () => { $("assign-form").classList.remove("hidden"); $("af-title").focus(); };
+$("assign-new").onclick = () => { $("assign-form").classList.remove("hidden"); $("af-msg").innerHTML = ""; $("af-title").focus(); };
 $("af-cancel").onclick = () => $("assign-form").classList.add("hidden");
 $("af-save").onclick = () => {
   try {
     const a = assignments.add({title: $("af-title").value, course: $("af-course").value, due: $("af-due").value,
-      brief: $("af-brief").value, rubric: $("af-rubric").value});
+      brief: $("af-brief").value, rubric: $("af-rubric").value, module: MOD});
     ["af-title", "af-course", "af-due", "af-brief", "af-rubric"].forEach((id) => ($(id).value = ""));
     $("assign-form").classList.add("hidden");
     $("af-msg").innerHTML = "";
@@ -310,9 +466,16 @@ function saveAssign(change) {
   ASSIGN = a;
 }
 function openAssignment(id) {
+  flushModNotes();
   ASSIGN = assignments.get(id); LESSON = null;
-  $("assign-list-view").classList.add("hidden");
+  MOD = ASSIGN.module;
+  $("mod-list-view").classList.add("hidden");
+  $("mod-view").classList.add("hidden");
   $("assign-detail").classList.remove("hidden");
+  $("ad-back").textContent = "← Back to " + modules.get(MOD).name;
+  $("ad-move").innerHTML = modules.list().map((m) => '<option value="' + esc(m.key) + '">' + esc(m.name) + "</option>").join("");
+  $("ad-move").value = MOD;
+  $("ad-move-msg").innerHTML = "";
   $("ad-title").textContent = ASSIGN.title;
   $("ad-meta").textContent = [ASSIGN.course, ASSIGN.due ? "due " + ASSIGN.due : ""].filter(Boolean).join(" · ");
   $("ad-brief-text").innerHTML = "<h3>Brief</h3>" + md(ASSIGN.brief_text) + (ASSIGN.rubric_text ? "<h3>Rubric</h3>" + md(ASSIGN.rubric_text) : "");
@@ -435,7 +598,7 @@ $("aw-feedback").onclick = (e) => {
 };
 $("ad-export").onclick = () => {
   flushDraft(); flushNotes();
-  download(reloadAssign().id + ".txt", E.assignmentMarkdown(ASSIGN));
+  download(E.safeName(reloadAssign().title) + ".txt", E.assignmentMarkdown(ASSIGN));
 };
 $("aq-go").onclick = () => startQuiz(E.ASSIGNMENT_PREFIX + ASSIGN.id);
 $("aq-gen").onclick = async () => {
@@ -450,12 +613,22 @@ $("aq-gen").onclick = async () => {
   } catch (e) { note($("aq-msg"), "bad", e.message); }
   busy(btn, false);
 };
-$("ad-back").onclick = () => { flushDraft(); flushNotes(); loadAssignments(); };
+$("ad-back").onclick = () => { flushDraft(); flushNotes(); const k = reloadAssign().module; ASSIGN = null; openModule(k); };
+$("ad-move-go").onclick = () => {
+  try {
+    flushDraft(); flushNotes();
+    const a = assignments.move(ASSIGN.id, $("ad-move").value);
+    ASSIGN = a; MOD = a.module;
+    $("ad-back").textContent = "← Back to " + modules.get(MOD).name;
+    note($("ad-move-msg"), "good", "Moved to " + modules.get(MOD).name + ".");
+  } catch (e) { note($("ad-move-msg"), "bad", e.message); }
+};
 $("ad-delete").onclick = () => {
   if (!confirm("Delete this assignment, its drafts, notes and quiz questions from this browser?")) return;
+  const k = ASSIGN.module;
   assignments.remove(ASSIGN.id);
   ASSIGN = null;
-  loadAssignments();
+  openModule(k);
 };
 function showSub(name) {
   document.querySelectorAll("#ad-nav button").forEach((b) => b.classList.toggle("active", b.dataset.sub === name));
@@ -464,44 +637,110 @@ function showSub(name) {
 $("ad-nav").addEventListener("click", (e) => { if (e.target.dataset.sub) showSub(e.target.dataset.sub); });
 
 // --------------------------------------------------------------- settings ---
-function providerKeys() {
-  return Object.keys(E.PROVIDERS).filter((k) => !E.PROVIDERS[k].localOnly || E.isLocalPage());
+const KEYLESS = ["auto", "chrome", "pollinations", "webllm"];
+const AI_TEXT = {
+  auto: "Recommended. Works straight away with no account or key. Uses Chrome's built-in AI if this computer has it, " +
+    "otherwise the private AI if you've downloaded it, otherwise the free shared AI. If one stops working it switches to the next.",
+  chrome: "Private: everything stays on this computer. Free, no account. Needs a recent Chrome on a newer computer " +
+    "(Google lists macOS 13+ or Windows 10/11 with 16 GB of memory).",
+  pollinations: "No account or key. Your questions and any assignment text are sent to Pollinations, a free public service " +
+    "run by a third party, with no guarantee it stays available. Slow: it lets each person send roughly one request every " +
+    "45 seconds, so a 10-question quiz can take several minutes. Generate questions ahead of time to avoid waits.",
+  webllm: "Private: downloads a small AI (about 1 GB) into this browser once, then runs on this computer, even offline. " +
+    "Needs a fairly recent computer and Chrome (WebGPU). Its answers are simpler and less accurate than the online AIs.",
+};
+let AI_STATUS = {};
+function advancedKeys() {
+  return Object.keys(E.PROVIDERS).filter((k) => !KEYLESS.includes(k) && (!E.PROVIDERS[k].localOnly || E.isLocalPage()));
 }
+async function refreshAIStatus() {
+  const chrome = await E.chromeAIStatus();
+  const gpu = await E.webgpuSupported();
+  const ready = (store.get("meta", {}) || {}).webllm_ready;
+  AI_STATUS = {
+    chrome: chrome === "available" ? ["good", "ready on this computer"] : chrome === "unavailable" ? ["bad", "not available on this computer"]
+      : ["", "Chrome needs a large one-time download first"],
+    webllm: ready ? ["good", "downloaded"] : gpu ? ["", "not downloaded yet"] : ["bad", "not supported on this computer"],
+    pollinations: ["", "slow, shared"],
+    auto: ["good", "no setup"],
+  };
+  AI_STATUS.chromeRaw = chrome; AI_STATUS.gpu = gpu;
+  renderAIOptions();
+}
+function renderAIOptions() {
+  const cur = SETTINGS.provider;
+  const rows = KEYLESS.map((k) => {
+    const st = AI_STATUS[k] || ["", ""];
+    const off = (k === "chrome" && AI_STATUS.chromeRaw === "unavailable") || (k === "webllm" && AI_STATUS.gpu === false);
+    return '<label class="ai-opt' + (cur === k ? " on" : "") + (off ? " off" : "") + '"><input type="radio" name="ai" value="' + k + '"' +
+      (cur === k ? " checked" : "") + (off ? " disabled" : "") + "><div><b>" + esc(E.PROVIDERS[k].label) + "</b>" +
+      (st[1] ? '<span class="tag ' + st[0] + '">' + esc(st[1]) + "</span>" : "") + '<p class="why">' + esc(AI_TEXT[k]) + "</p></div></label>";
+  });
+  const keyed = !KEYLESS.includes(cur);
+  rows.push('<label class="ai-opt' + (keyed ? " on" : "") + '"><input type="radio" name="ai" value="__own"' + (keyed ? " checked" : "") +
+    "><div><b>My own free key</b>" + (keyed ? '<span class="tag good">' + esc(SETTINGS.label) + "</span>" : "") +
+    '<p class="why">Fastest and most reliable. Takes about a minute to set up with a Google, Groq or OpenRouter account. Set it up under Advanced below.</p></div></label>');
+  $("ai-options").innerHTML = rows.join("");
+  $("webllm-box").classList.toggle("hidden", cur !== "webllm" || !!(store.get("meta", {}) || {}).webllm_ready);
+}
+$("ai-options").addEventListener("change", (e) => {
+  const k = e.target.value;
+  if (k === "__own") { $("adv").open = true; $("set-key").focus(); return; }
+  E.saveSettings(store, {provider: k});
+  SETTINGS = E.loadSettings(store);
+  showStatus();
+  renderAIOptions();
+  note($("set-msg"), "good", "Now using: " + SETTINGS.label + ".");
+});
+$("webllm-go").onclick = async () => {
+  const btn = $("webllm-go");
+  busy(btn, true);
+  $("webllm-bar").classList.remove("hidden");
+  try {
+    await new E.WebLLMClient({}, {store, onProgress: (text, frac) => { $("webllm-msg").textContent = text; if (frac != null) $("webllm-bar").value = frac; }}).engine();
+    $("webllm-msg").textContent = "Done. The private AI is ready and works offline from now on.";
+    refreshAIStatus();
+  } catch (e) { $("webllm-msg").textContent = e.message; }
+  $("webllm-bar").classList.add("hidden");
+  busy(btn, false);
+};
 function fillSettings() {
-  const sel = $("set-provider");
-  sel.innerHTML = providerKeys().map((k) => '<option value="' + k + '">' + esc(E.PROVIDERS[k].label) + "</option>").join("");
-  sel.value = providerKeys().includes(SETTINGS.provider) ? SETTINGS.provider : E.DEFAULT_PROVIDER;
-  $("welcome").hidden = E.isConfigured(SETTINGS);
+  const sel = $("set-provider"), keys = advancedKeys();
+  sel.innerHTML = keys.map((k) => '<option value="' + k + '">' + esc(E.PROVIDERS[k].label) + "</option>").join("");
+  const last = (store.get("settings", {}) || {}).lastKeyed;
+  sel.value = keys.includes(SETTINGS.provider) ? SETTINGS.provider : keys.includes(last) ? last : "gemini";
+  if (keys.includes(SETTINGS.provider)) $("adv").open = true;
+  renderAIOptions();
+  refreshAIStatus();
   onProvider(true);
   fillBackupInfo();
 }
 function currentForm() {
-  const k = $("set-provider").value, p = E.PROVIDERS[k];
+  const k = $("set-provider").value, p = E.PROVIDERS[k], saved = E.loadSettings(store, k);
   const typed = $("set-key").value.trim();
-  return {provider: k, label: p.label, needsKey: p.needsKey,
+  return {provider: k, label: p.label, needsKey: p.needsKey, kind: p.kind,
     url: k === "custom" ? $("set-url").value.trim() : p.url,
-    apiKey: typed || (k === SETTINGS.provider ? SETTINGS.apiKey : ""),
+    apiKey: typed || saved.apiKey,
     model: modelValue() || p.model};
 }
 function modelValue() {
   const pick = $("set-model-pick").value;
   return pick && pick !== "__type" ? pick : $("set-model").value.trim();
 }
-function onProvider(initial) {
-  const k = $("set-provider").value, p = E.PROVIDERS[k], same = k === SETTINGS.provider;
-  $("set-url").value = same ? (SETTINGS.provider === "custom" ? SETTINGS.url : "") : "";
+function onProvider() {
+  const k = $("set-provider").value, p = E.PROVIDERS[k], saved = E.loadSettings(store, k);
+  $("set-url").value = k === "custom" ? saved.url : "";
   $("set-url-wrap").classList.toggle("hidden", k !== "custom");
   $("set-model-wrap").classList.toggle("hidden", k === "local");
   $("set-key-wrap").classList.toggle("hidden", !p.needsKey);
   $("set-key").value = "";
-  $("set-key").placeholder = same && SETTINGS.apiKey ? "Saved in this browser. Leave blank to keep it." : "Paste your key";
+  $("set-key").placeholder = saved.apiKey ? "Saved in this browser. Leave blank to keep it." : "Paste your key";
   $("set-keylink").innerHTML = p.keyUrl ? 'Get a free key at <a href="' + esc(p.keyUrl) + '" target="_blank" rel="noopener">' + esc(p.keyUrl) + "</a>" :
     (k === "local" ? "Make sure llama-server is running (see README)." : "");
-  $("set-msg").innerHTML = "";
+  $("adv-msg").innerHTML = "";
   MODELS = null;
-  setModelChoices(null, same ? SETTINGS.model : p.model);
+  setModelChoices(null, saved.model || p.model);
   if (k !== "local") loadModels(true);
-  if (!initial) $("set-msg").innerHTML = "";
 }
 function setModelChoices(models, want) {
   const sel = $("set-model-pick");
@@ -530,39 +769,45 @@ async function loadModels(quiet) {
     setModelChoices(MODELS, modelValue() || f.model);
     msg.textContent = MODELS.length + " models available. Pick one, or keep the suggested one.";
   } catch (e) {
-    msg.textContent = (quiet ? "" : "") + e.message + " You can type a model name instead.";
+    msg.textContent = e.message + " You can type a model name instead.";
     if (!quiet) { $("set-model-pick").value = "__type"; $("set-model-type-wrap").classList.remove("hidden"); }
   }
 }
 $("set-load-models").onclick = () => loadModels(false);
 $("set-key").addEventListener("change", () => loadModels(true));
 $("set-url").addEventListener("change", () => loadModels(true));
-$("set-provider").onchange = () => onProvider(false);
+$("set-provider").onchange = () => onProvider();
 $("set-save").onclick = () => {
   const f = currentForm();
-  if (f.provider === "custom" && !/^https?:\/\//.test(f.url)) { note($("set-msg"), "bad", "Enter the API address (it starts with https://)."); return; }
-  if (f.needsKey && !f.apiKey) { note($("set-msg"), "bad", "Paste your API key first."); return; }
+  if (f.provider === "custom" && !/^https?:\/\//.test(f.url)) { note($("adv-msg"), "bad", "Enter the API address (it starts with https://)."); return; }
+  if (f.needsKey && !f.apiKey) { note($("adv-msg"), "bad", "Paste your API key first."); return; }
   try {
     E.saveSettings(store, f);
+    store.set("settings", Object.assign(store.get("settings", {}), {lastKeyed: f.provider}));
     SETTINGS = E.loadSettings(store);
     showStatus();
-    $("welcome").hidden = true;
     $("banner").innerHTML = "";
-    onProvider(true);
-    note($("set-msg"), "good", "Saved. Now using " + SETTINGS.label + " · " + SETTINGS.model + ". Click Test connection to check it works.");
-  } catch (e) { note($("set-msg"), "bad", e.message); }
+    onProvider();
+    renderAIOptions();
+    note($("adv-msg"), "good", "Saved. Now using " + SETTINGS.label + " · " + SETTINGS.model + ". Click Test the AI to check it works.");
+  } catch (e) { note($("adv-msg"), "bad", e.message); }
 };
 $("set-check").onclick = async () => {
   thinking($("set-msg"));
-  try { note($("set-msg"), "good", await new E.LLM(currentForm()).check()); } catch (e) { note($("set-msg"), "bad", e.message); }
+  try { note($("set-msg"), "good", await llm().check()); } catch (e) { note($("set-msg"), "bad", e.message); }
+  onRetry(0);
 };
 $("set-forget").onclick = () => {
-  if (!confirm("Remove your API key from this browser? Your work stays.")) return;
-  E.saveSettings(store, Object.assign({}, SETTINGS, {apiKey: ""}));
+  const k = $("set-provider").value;
+  if (!confirm("Remove your " + E.PROVIDERS[k].label + " key from this browser? Your work stays.")) return;
+  const saved = E.loadSettings(store, k);
+  const was = SETTINGS.provider;
+  E.saveSettings(store, Object.assign({}, saved, {provider: k, apiKey: ""}));
+  E.saveSettings(store, {provider: was === k ? "auto" : was});  // switch back to no-setup if that key was in use
   SETTINGS = E.loadSettings(store);
   showStatus();
   fillSettings();
-  note($("set-msg"), "good", "Key removed from this browser.");
+  note($("adv-msg"), "good", "Key removed from this browser." + (was === k ? " Switched to Automatic (no setup)." : ""));
 };
 
 // ------------------------------------------------------------ backups ---
@@ -579,13 +824,14 @@ function downloadBackup() {
   fillBackupInfo();
 }
 $("bk-download").onclick = safe(downloadBackup);
+$("bk-zip").onclick = safe(() => download("learning-engine-modules-" + E.todayStr() + ".zip", E.makeZip(E.moduleFiles(store)), "application/zip"));
 $("bk-file").onchange = async (e) => {
   const file = e.target.files[0];
   e.target.value = "";
   if (!file) return;
   try {
     const counts = E.importBackup(store, JSON.parse(await file.text()));
-    note($("bk-msg"), "good", "Restored: " + counts.questions + " questions, progress for " + counts.topics + " topics and " + counts.assignments + " assignments.");
+    note($("bk-msg"), "good", "Restored: " + counts.questions + " questions, progress for " + counts.topics + " topics and " + counts.assignments + " assignments" + (counts.modules ? ", " + counts.modules + " modules" : "") + ".");
   } catch (err) { note($("bk-msg"), "bad", err instanceof SyntaxError ? "That file isn't a Learning Engine backup." : err.message); }
 };
 $("bk-legacy").onclick = async () => {
@@ -594,7 +840,7 @@ $("bk-legacy").onclick = async () => {
     const r = await fetch("api/export");
     if (!r.ok) throw new Error("Couldn't read the app folder (HTTP " + r.status + "). Start the app with `python main.py web`.");
     const counts = E.importBackup(store, await r.json());
-    note($("bk-msg"), "good", "Brought in " + counts.questions + " questions, progress for " + counts.topics + " topics and " + counts.assignments + " assignments.");
+    note($("bk-msg"), "good", "Brought in " + counts.questions + " questions, progress for " + counts.topics + " topics and " + counts.assignments + " assignments" + (counts.modules ? ", " + counts.modules + " modules" : "") + ".");
   } catch (err) { note($("bk-msg"), "bad", err.message); }
 };
 $("bk-wipe").onclick = () => {
@@ -642,7 +888,12 @@ showStatus();
 loadToday();
 loadTopics();
 if (!E.isConfigured(SETTINGS)) {
-  showTab("settings");
+  showTab("settings");  // an own-key service with its key removed
+} else if (!(store.get("meta", {}) || {}).welcomed) {
+  store.set("meta", Object.assign(store.get("meta", {}) || {}, {welcomed: E.nowIso()}));
+  if (SETTINGS.provider === "auto")
+    showBanner("good", "Welcome! No setup needed: the app uses a free AI automatically. Pick a module and start a quiz, or open Modules to add your own class subjects. " +
+      "(The free shared AI can be slow. For faster answers, add your own free key in Settings.)");
 } else {
   maybeRemindBackup();
 }

@@ -6,7 +6,7 @@ from typing import Optional
 from rich.markup import escape
 
 from . import backup, config, generator, models, review, stats, topics, ui
-from .assignments import AssignmentStore
+from .assignments import GENERAL, AssignmentStore, module_key
 from .llm_client import LLMClient, LLMError
 from .progress import Progress
 from .question_bank import QuestionBank
@@ -149,6 +149,10 @@ def cmd_topics() -> None:
     for key, t in config.TOPICS.items():
         tot = Progress(key).totals()
         rows.append({"key": key, "name": t["name"], "questions": len(QuestionBank(key)), **tot})
+    for key, m in topics.saved_modules().items():
+        if key not in config.TOPICS and isinstance(m, dict) and m.get("name"):
+            tot = Progress(key).totals()
+            rows.append({"key": key, "name": m["name"], "questions": len(QuestionBank(key)), **tot})
     for a in AssignmentStore().list():
         key = topics.ASSIGNMENT_PREFIX + a["id"]
         tot = Progress(key).totals()
@@ -291,25 +295,51 @@ def _get_assignment(aid: Optional[str]) -> Optional[dict]:
         except KeyError:
             ui.error("No assignment with id '{}'.".format(aid))
             return None
-    i = ui.choose("Which assignment?", ["{} [dim]({})[/]".format(escape(a["title"]), a["id"]) for a in items])
+    i = ui.choose("Which assignment?", ["{} [dim]({} · {})[/]".format(
+        escape(a["title"]), escape(topics.module_name(a["module"])), a["id"]) for a in items])
     return items[i]
+
+
+def _known_modules() -> list:
+    """Module folders to offer: the built-in topics, General, and any folders you've made."""
+    keys = [GENERAL] + list(config.TOPICS) + list(topics.STARTER_NAMES) + list(topics.saved_modules())
+    for k in AssignmentStore().modules():
+        keys.append(k)
+    seen, out = set(), []
+    for k in keys:
+        if k not in seen:
+            seen.add(k)
+            out.append(k)
+    return out
+
+
+def _choose_module() -> str:
+    keys = _known_modules()
+    opts = ["{} [dim]({})[/]".format(escape(topics.module_name(k)), k) for k in keys] + ["A new module..."]
+    i = ui.choose("Which module (folder) is it for?", opts)
+    if i < len(keys):
+        return keys[i]
+    name = ui.ask("New module name (e.g. Music composition)")
+    return module_key(name) if name.strip() else GENERAL
 
 
 def cmd_assignment_add() -> None:
     ui.title("Add an assignment")
     title = ui.ask("Title")
-    course = ui.ask("Course/module (optional)", default="")
+    module = _choose_module()
+    course = ui.ask("Course code (optional)", default="")
     due = ui.ask("Due date (optional)", default="")
     brief = ui.ask_multiline("Paste the assignment brief / task description.")
     rubric = ""
     if ui.confirm("Do you have a marking rubric or criteria to paste too?", default=False):
         rubric = ui.ask_multiline("Paste the rubric.")
     try:
-        a = AssignmentStore().add(title, brief, course=course, due=due, rubric_text=rubric)
+        a = AssignmentStore().add(title, brief, course=course, due=due, rubric_text=rubric, module=module)
     except ValueError as e:
         ui.error(str(e))
         return
-    ui.ok("Saved as '{}'.".format(a["id"]))
+    ui.ok("Saved as '{}' in the {} folder (data/assignments/{}/).".format(
+        a["id"], escape(topics.module_name(a["module"])), a["module"]))
     try:
         with ui.spin("Working out the key concepts"):
             concepts = Tutor().concepts(a)
@@ -324,9 +354,14 @@ def cmd_assignment_list() -> None:
     if not items:
         ui.warn("No assignments yet. Add one with `assignment add`.")
         return
-    for a in items:
+    current = None
+    for a in sorted(items, key=lambda x: (x["module"] != GENERAL, x["module"], x["title"].lower())):
+        if a["module"] != current:
+            current = a["module"]
+            ui.console.print("\n[bold]📁 {}[/]  [dim]data/assignments/{}/[/]".format(
+                escape(topics.module_name(current)), current))
         extra = " · due {}".format(a["due"]) if a.get("due") else ""
-        ui.console.print("[bold]{}[/]  {}{}  [dim]{} drafts reviewed[/]".format(
+        ui.console.print("  [bold]{}[/]  {}{}  [dim]{} drafts reviewed[/]".format(
             a["id"], escape(a["title"]), escape(extra), len(a.get("drafts", []))))
 
 

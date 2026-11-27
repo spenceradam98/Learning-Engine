@@ -9,7 +9,8 @@ from .llm_client import LLMError
 
 # Models that can't chat (speech, images, embeddings, safety filters).
 _NOT_CHAT = ("whisper", "tts", "embed", "imagen", "veo", "aqa", "guard", "orpheus",
-             "moderation", "dall-e", "image-generation", "native-audio", "learnlm")
+             "moderation", "dall-e", "image", "native-audio", "audio", "live", "learnlm",
+             "computer-use", "robotics", "lyria")
 
 
 def models_url(chat_url: str) -> str:
@@ -53,6 +54,8 @@ def parse_models(data: object, provider: str) -> List[dict]:
             continue
         if it.get("active") is False:
             continue
+        if provider == "gemini" and low.startswith("gemma"):
+            continue  # Gemma on Gemini's API rejects the instructions this app sends
         seen.add(mid)
         out.append({"id": mid, "free": _is_free(it)})
     if provider == "openrouter":
@@ -77,9 +80,9 @@ def list_models(settings: dict, timeout: int = 15) -> List[dict]:
         r = requests.get(models_url(url), headers=headers, timeout=timeout)
     except requests.RequestException as e:
         raise LLMError("Couldn't load the model list. Check your internet connection.") from e
-    if r.status_code in (401, 403):
-        raise LLMError("The API rejected your key (HTTP {}), so the model list couldn't be "
-                       "loaded. Check the key.".format(r.status_code))
+    if r.status_code in (401, 403) or (r.status_code == 400 and "api key" in r.text.lower()):
+        raise LLMError("The API rejected your key, so the model list couldn't be loaded. "
+                       "Check the key.")
     if r.status_code != 200:
         raise LLMError("Couldn't load the model list (HTTP {}). You can type a model name "
                        "instead.".format(r.status_code))

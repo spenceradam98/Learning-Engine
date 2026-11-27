@@ -26,7 +26,8 @@ def generate_one(llm: LLMClient, bank: QuestionBank, info: topics.TopicInfo,
                  subtopic: str, difficulty: int, source: str = "generated") -> Optional[dict]:
     """Make and store one question. Returns None if it came out as a duplicate."""
     msgs = prompts.question_messages(info.name, subtopic, difficulty,
-                                     avoid=bank.recent_texts(subtopic, 6), context=info.context)
+                                     avoid=bank.recent_texts(subtopic, 6), context=info.context,
+                                     context_kind=info.context_kind)
     cleaned = llm.chat_json(msgs, prompts.QUESTION_SCHEMA, validate_question,
                             temperature=0.6, max_tokens=500)
     return bank.add(cleaned, subtopic, difficulty, source=source)
